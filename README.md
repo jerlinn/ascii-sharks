@@ -1,5 +1,7 @@
 # ascii sharks
 
+![Koi drawn in ASCII glyphs swimming in a pale green pond](docs/cover.gif)
+
 ```
                             ;'
                              %%'
@@ -23,7 +25,7 @@ t'                            ''XSSS8SSX%XX8#.    %XSX%
 Fish and sharks drawn as ASCII on a canvas. Zero dependencies.
 
 ```sh
-npm install && npm run dev
+pnpm install && pnpm dev
 ```
 
 ```ts
