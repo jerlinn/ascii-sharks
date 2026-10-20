@@ -8,10 +8,11 @@
  */
 import { CanopyField } from "./canopy";
 import { CausticsField } from "./caustics";
+import { CloudField } from "./clouds";
 import { clamp, hash3, smoothstep, valueNoise, windAt } from "./math";
 import { RippleField } from "./ripple";
 import type { RGB, Scene } from "./scene";
-import { BUBBLE_LIFE, BUBBLE_RISE, SHARK_NODES, type Shark, type SharkKind, type World } from "./world";
+import { BUBBLE_LIFE, BUBBLE_RISE, SHARK_NODES, SLITHER_K, type Shark, type SharkKind, type World } from "./world";
 
 const ALPHA_LEVELS = 6;
 const FISH_ALPHAS = [0.28, 0.42, 0.58, 0.74, 0.9];
@@ -58,6 +59,39 @@ const CAUSTIC_GLYPHS = ".:o";
 const CAUSTIC_INKS = 8;
 /** How much of the gust field's range shakes a canopy's branches. */
 const CANOPY_GUST: [number, number] = [0.35, 0.8];
+/**
+ * The grain on a cloud's face, sparse on the lit ones and fuller in shade. Round, with no way to
+ * them, like the beads of the caustics; from the brightest face to the dimmest.
+ */
+const CLOUD_GLYPHS = ".:oO@";
+/** How many steps darker than its fill a cloud's glyph is inked. */
+const CLOUD_INK = 3;
+/** Steps of cloud brightness, each one fillStyle; the darkest is not drawn. */
+const CLOUD_LEVELS = 12;
+/** The faintest level a cloud is drawn at where it hides part of a creature. */
+const CLOUD_VEIL = 4;
+/** Cloud this thick (in the tops' 0–1) is solid; thinner wisps let the sky through. */
+const CLOUD_BODY = 0.45;
+/** How dark a flyer's shadow makes the sunlit tops it falls on. */
+const CLOUD_SHADOW = 0.55;
+/**
+ * A flyer and the cloud, in the tops' 0–1 height. Above the top it is clear MIST_BAND up and fades
+ * toward the scene's fog to MIST_TOP at the top. Below it, it is veiled further, to MIST_DEEP, as
+ * it goes VEIL_DEPTH down, and hidden outright only once that deep in cloud at least VEIL_THICK
+ * thick: diving in, a body thins into the cloud by degrees, and through thin cloud it still shows.
+ */
+const MIST_BAND = 0.22;
+const MIST_TOP = 0.35;
+const MIST_DEEP = 0.88;
+const VEIL_DEPTH = 0.35;
+const VEIL_THICK = 0.55;
+/** A modelled head's height for its half-width, and the sun's elevation over it (radians). */
+const HEAD_HEIGHT = 0.9;
+const HEAD_SUN = 0.75;
+/** How far a flyer's shadow falls on the clouds per unit of height above them, as a fraction of its length. */
+const LIFT_SHADOW = 0.07;
+/** A flyer looks this much wider per unit of height above the tops' middle: it is nearer the eye. */
+const LIFT_SCALE = 0.2;
 
 // Dot colour classes: blue, green, red, pale. The wake class after them takes the scene's colour.
 const DOT_RGB: RGB[] = [
@@ -68,6 +102,24 @@ const DOT_RGB: RGB[] = [
 ];
 const DOT_BASE_ALPHA = [1, 1, 1, 1, 1];
 const WAKE = DOT_RGB.length;
+
+/**
+ * Candidates for the measured ink ramp: marks and round shapes, from a dot to the densest blots
+ * (`$` and `&` dropped: dense, but busy enough to read as noise across a face).
+ * Left out are the glyphs that draw a line or a bracket (`- _ = ~ | / \ ( ) [ ] { } < >`), which
+ * point a way and read as strokes rather than tone, and letters, which in a row read as words: a
+ * body inked in `tvvvtnaSM` looked like garbled text. INK_STEPS of the candidates, evenly spaced
+ * in measured ink, make the ramp.
+ */
+const INK_CANDIDATES = " .,:;'\"`^*+oO0@#%8";
+const INK_STEPS = 16;
+/**
+ * How steeply a measured ramp's ink rises into the shade: ink = (1 − light) ^ INK_CURVE. And its
+ * ink colour, as a share of the skin under it: the dense glyphs a measured ramp reaches for would
+ * grey a white body at the koi's darker ink.
+ */
+const INK_CURVE = 2.2;
+const MEASURED_INK = 0.72;
 
 // Sparse glyphs on bright skin, dense glyphs in shadow, so the texture
 // reinforces the shading instead of fighting it.
@@ -91,6 +143,33 @@ const FLAG_HI = 7;
 const HI_TINT: RGB = [1.55, 0.5, 0.24];
 /** Pale skin in the shape's own `pectoralTint`: humpback flippers, and throat pleats on a lunge. */
 const FLAG_PALE = 8;
+/**
+ * A strand thinner than a cell, a dragon's barbel: a pale glyph with no block, so it reads as a
+ * thread of light rather than a row of solid cells or scattered specks of edge.
+ */
+const FLAG_STRAND = 9;
+/** A claw: pale like a horn, and like a strand too thin to cover a cell, so solid on a centre hit. */
+const FLAG_CLAW = 10;
+/**
+ * The thick root of a barbel: white skin, solid on a centre hit like a claw, so the barbel reads
+ * as a line of light leaving the muzzle and only thins to a thread (FLAG_STRAND) past
+ * WHISKER_SOLID of its length. Drawn as strands all the way, it was too faint to hold the head.
+ */
+const FLAG_WHISKER = 11;
+const WHISKER_SOLID = 0.55;
+/**
+ * A lock of the tail's hair: solid jade near its root, like a barbel's (FLAG_HAIR), then a jade
+ * thread (FLAG_HAIR_END) past HAIR_SOLID of its length. The locks start TAIL_ROOT of the length
+ * before the tip, so they grow out of the tail rather than off its end.
+ */
+const FLAG_HAIR = 12;
+const FLAG_HAIR_END = 13;
+const HAIR_SOLID = 0.8;
+const TAIL_ROOT = 0.05;
+/** Numbers per leg in a pose (see poseLegs), and how slowly the legs shift against the body wave's phase. */
+const LEG_POSE = 7;
+const LEG_RATE = 0.5;
+const STRAND_GLYPHS = ".:+";
 const KOI_VARIETIES = 4;
 
 // Ripple water (simulated in ripple.ts): the crest height that starts to show, and how fast
@@ -213,6 +292,64 @@ interface SharkShape {
   gills: [number, number];
   /** Skin colour multipliers (r, g, b). */
   tint: [number, number, number];
+  /** Colour of a glossy shape's fins, and of its FLAG_HI skin; koi white and koi red when absent. */
+  finTint?: RGB;
+  hiTint?: RGB;
+  /** The eye's glyph colour. */
+  eyeInk?: string;
+  /**
+   * Horns, one each side: a tapering blade from (u0, a0) to (u1, a1) along and out from the
+   * spine, root thickness `width`. Fractions of length. Drawn pale, in pectoralTint.
+   */
+  horns?: { u0: number; a0: number; u1: number; a1: number; width: number };
+  /**
+   * Barbels trailing from the snout, one each side: root (u, a), how far back (`length`) and out
+   * (`spread`) they run, and how far they wave. Fractions of length; a few px thick, so they
+   * draw as a trail of light edge glyphs.
+   */
+  whiskers?: { u: number; a: number; length: number; spread: number; wave: number };
+  /**
+   * Fur down the back in the hi colour: a strip `strip` of the half-width wide from `from` along
+   * the body, flaring past the flanks over `ruff` (from, to) in tufts up to `size` of the length,
+   * and a tail of `tail.count` long locks fanning back from the tip, the middle one longest at
+   * `tail.length` of the length, spreading `tail.spread` either side at their ends. The tufts and
+   * locks stream back as the body flies.
+   */
+  mane?: {
+    strip: number;
+    from: number;
+    ruff: [number, number];
+    size: number;
+    tail: { count: number; length: number; spread: number };
+  };
+  /**
+   * Skin glyphs from a ramp measured off the font's own ink (measureInk), so a glyph's darkness
+   * follows the shading and the strokes carry the body's volume, rather than a short hand-picked set.
+   */
+  measuredInk?: boolean;
+  /**
+   * Legs instead of fins, rooted where the pectorals and pelvics would be: an upper limb and a
+   * forearm bent at the elbow (lengths and root half-thickness, fractions of length), a tuft of
+   * fur at the elbow in the hi colour, and a hand at the wrist with three claws fanned from it,
+   * pale like the horns. The forelegs reach forward to grasp, the hind legs trail back, and they
+   * stroke in diagonal pairs.
+   */
+  legs?: { upper: number; lower: number; claw: number; thick: number };
+  /**
+   * Height in flight along the body, in the cloud tops' 0–1: the head held at `head`, the body
+   * rising and dipping `swing` about `mid`, k radians per length. The wave keeps still in
+   * space as the body slides through it, so the body dives into the clouds and comes up again
+   * at the same spots, like a serpent through waves.
+   */
+  lift?: { head: number; mid: number; swing: number; k: number };
+  /**
+   * The head modelled as a surface rather than the body's round tube, back to `to` along the
+   * body: a rounded skull, a ridge down the bridge of the nose `ridge` high, and brows `brow`
+   * high swelling over the eyes. Lit by its slopes toward the sun, across and along it.
+   */
+  relief?: { to: number; ridge: number; brow: number };
+  /** How far past the spine any part reaches, as a fraction of length; bounds the cell search. */
+  extent?: number;
 }
 
 const SHAPES: Record<SharkKind, SharkShape> = {
@@ -420,6 +557,61 @@ const SHAPES: Record<SharkKind, SharkShape> = {
     gills: [0, 0],
     tint: [0.66, 0.72, 0.8],
   },
+  // A white river dragon: long and slender as a serpent, a narrow muzzle and cheeks that swell
+  // at the jaw, a slim neck, an even body tapering to a tuft at the tail. Pearl-white scales, a
+  // jade mane down the back that flares at the neck, pale horns, long barbels, four small legs.
+  dragon: {
+    // The head is drawn well over twice its true share of the length, as a portrait gives the
+    // face room: about eleven cells across, twice the neck. Smaller, its eyes, horns and barbels
+    // each had a cell or two and ran together. The muzzle is slim and nearly straight-sided to a
+    // round nose, flaring only at the eyes: tapering all the way from the cheeks, it read as a
+    // wide, open, triangular jaw. A long muzzle,
+    // cheeks at the eyes, the skull, then a neck plainly narrower than the head, so the head
+    // stands apart from the body instead of running into it.
+    halfWidth: (s) => {
+      if (s < 0.016) return 0.018 * Math.pow(Math.sin(((s / 0.016) * Math.PI) / 2), 0.5);
+      if (s < 0.048) return 0.018 + 0.003 * smoothstep(0.016, 0.048, s);
+      if (s < 0.074) return 0.021 + 0.034 * smoothstep(0.048, 0.074, s);
+      if (s < 0.103) return 0.055 - 0.009 * smoothstep(0.076, 0.103, s);
+      if (s < 0.135) return 0.046 - 0.028 * smoothstep(0.103, 0.135, s);
+      if (s < 0.75) return 0.018 + 0.006 * smoothstep(0.135, 0.29, s);
+      const k = (s - 0.75) / 0.25;
+      return 0.024 * Math.pow(1 - k, 1.2) + 0.005 * k;
+    },
+    // Leg roots: shoulders and hips. The legs themselves are `legs`, not these fins.
+    pectoral: [0.23, 0.25, 0.28, 0.06],
+    falcate: false,
+    // About three cells thick at the shoulder: thinner, a leg was a one-cell stick and its elbow,
+    // claws and tuft fell between the cells. Short beside the body, or it reads as a lizard.
+    legs: { upper: 0.045, lower: 0.038, claw: 0.028, thick: 0.016 },
+    pelvic: [0.46, 0.48, 0.51, 0.06],
+    // No tail fin: the tail ends in locks of hair (mane.tail).
+    caudal: 0,
+    glossy: true,
+    measuredInk: true,
+    // Two S-bends from neck to tail, all the way along rather than growing to the tail.
+    wave: [0.06, 0.35, SLITHER_K],
+    finMotion: { flap: [0.4, 1], lag: 0.25, arch: 0.3 },
+    pectoralTint: [1.42, 1.32, 1.06],
+    finTint: [0.62, 1.12, 1.02],
+    hiTint: [0.42, 1.1, 0.96],
+    eyeInk: "#7ff0d0",
+    // Horns from the back of the skull, swept back and out clear of the head; long barbels from
+    // the muzzle, streaming back wide of the neck.
+    horns: { u0: 0.078, a0: 0.035, u1: 0.168, a1: 0.095, width: 0.011 },
+    whiskers: { u: 0.01, a: 0.019, length: 0.3, spread: 0.085, wave: 0.03 },
+    // Jade hair from behind the skull down the back, and a ruff at the neck: the head itself
+    // stays white, or its eyes, horns and barbels are lost in the jade.
+    mane: { strip: 0.28, from: 0.105, ruff: [0.125, 0.3], size: 0.028, tail: { count: 5, length: 0.15, spread: 0.06 } },
+    lift: { head: 1.2, mid: 0.45, swing: 0.55, k: 7 },
+    relief: { to: 0.12, ridge: 0.35, brow: 0.5 },
+    extent: 0.22,
+    dorsal: [0, 0],
+    secondDorsal: [0, 0],
+    eye: [0.057, 0.066],
+    gills: [0, 0],
+    tint: [1.3, 1.32, 1.36],
+  },
 };
 
 const KINDS = Object.keys(SHAPES) as SharkKind[];
@@ -435,6 +627,15 @@ function hexRGB(hex: string): RGB {
   const h = hex.replace("#", "");
   const full = h.length === 3 ? [...h].map((c) => c + c).join("") : h;
   return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16)) as RGB;
+}
+
+/** CLOUD_LEVELS colours from the sky through a cloud's dim faces (at half) to its lit ones. */
+function cloudRamp(dim: RGB, lit: RGB, sky: RGB) {
+  return Array.from({ length: CLOUD_LEVELS }, (_, k) => {
+    const b = k / (CLOUD_LEVELS - 1);
+    const [from, to, f] = b < 0.5 ? [sky, dim, b / 0.5] : [dim, lit, (b - 0.5) / 0.5];
+    return `rgb(${from.map((v, j) => Math.round(v + (to[j] - v) * f)).join(",")})`;
+  });
 }
 
 function inTriangle(
@@ -519,6 +720,26 @@ export class AsciiRenderer {
   private caustics = new CausticsField();
   private causticStyles: string[] = [];
   private glintStyle = "";
+  /** A cloud sea under the flyers, on a scene that has one, and how far the wind has carried it, px. */
+  private clouds = new CloudField();
+  private cloudDrift = { x: 0, y: 0 };
+  /** Cloud cells bucketed by brightness, and each bucket's colour: sky, through the dim faces, to the lit ones. */
+  private cloudBuckets: number[][] = Array.from({ length: CLOUD_LEVELS }, () => []);
+  private cloudStyles: string[] = [];
+  /** How far each creature cell has faded into the cloud it skims or flies in, 0–1, toward the fog. */
+  private sharkMist = new Float32Array(0);
+  /** The current shark's height-wave phase (its lift), and its height at the last sample. */
+  private liftPhase = 0;
+  private hitLift = 1;
+  /** The mane's tufts streaming back: their phase along the body. */
+  private flutter = 0;
+  /** The current creature's legs this frame, LEG_POSE numbers each (see poseLegs). */
+  private legPose = new Float32Array(4 * LEG_POSE);
+  /** Skin glyphs from sparse to dense by their measured ink, and the font they were measured in. */
+  private inkRamp = SKIN_RAMP;
+  private inkFont = "";
+  /** Where along the last segment() tested the point fell, 0–1. */
+  private segT = 0;
   private spine = new Float32Array(SHARK_NODES * 2);
   private arc = new Float32Array(SHARK_NODES);
   private arcTotal = 1;
@@ -532,6 +753,9 @@ export class AsciiRenderer {
    */
   private pecFrame = { x: 0, y: 0, tx: 1, ty: 0 };
   private pelFrame = { x: 0, y: 0, tx: 1, ty: 0 };
+  /** The tail's end, where its locks of hair are tested, and the body wave there: the locks carry it on. */
+  private tailFrame = { x: 0, y: 0, tx: 1, ty: 0 };
+  private tailWave = { amp: 0, phase: 0, k: 0 };
   /** The fins' pose this frame: a sweep (flap) about the root. */
   private finSweep = 0;
   /** Extra sweep at the fin tip: its lag behind the flap plus its resting arch. */
@@ -578,7 +802,7 @@ export class AsciiRenderer {
     this.bg = document.createElement("canvas");
   }
 
-  private applyScene(scene: Scene) {
+  private applyScene(scene: Scene, world: World) {
     // A theme only recolours: keep the water moving. A new scene starts its water still.
     const recast = this.scene?.name !== scene.name;
     this.scene = scene;
@@ -587,6 +811,8 @@ export class AsciiRenderer {
     // Leaf shade takes the floor-shadow colour: the same scattered light fills both in.
     this.canopy.set(scene.canopy, scene.light, shade ?? [0, 0, 0]);
     this.caustics.set(scene.caustics, scene.light);
+    this.clouds.set(scene.clouds, scene.light);
+    this.cloudStyles = scene.clouds ? cloudRamp(scene.clouds.dim, scene.clouds.lit, hexRGB(scene.background)) : [];
     const ink = scene.caustics?.ink;
     this.causticStyles = ink ? Array.from({ length: CAUSTIC_INKS }, (_, k) => `rgba(${ink.join(",")},${(0.35 + (0.6 * k) / (CAUSTIC_INKS - 1)).toFixed(2)})`) : [];
     this.glintStyle = scene.caustics ? `rgb(${scene.caustics.glintInk.join(",")})` : "";
@@ -611,6 +837,17 @@ export class AsciiRenderer {
     [this.lightX, this.lightY] = scene.light;
     this.ripple.setOpen(!scene.shore);
     if (recast) {
+      // A new sky opens with its cloud weighed against the creatures, not down the same side.
+      let cx = 0;
+      let cy = 0;
+      for (const sh of world.sharks) {
+        for (let k = 0; k < SHARK_NODES; k++) {
+          cx += sh.nodes[k * 2] / this.width - 0.5;
+          cy += sh.nodes[k * 2 + 1] / this.height - 0.5;
+        }
+      }
+      const nodes = Math.max(1, world.sharks.length * SHARK_NODES);
+      this.clouds.settle(Math.random, { x: cx / nodes, y: cy / nodes });
       // A glowing wake and a wave field don't mean the same thing; start the new water still.
       this.energy.fill(0);
       this.energyTmp.fill(0);
@@ -663,10 +900,12 @@ export class AsciiRenderer {
     this.sharkKind = new Uint8Array(n);
     this.sharkShadow = new Float32Array(n);
     this.floorShade = new Float32Array(n);
+    this.sharkMist = new Float32Array(n);
     this.fishStamp = new Uint32Array(n);
     this.ripple.resize(width, height, this.cw);
     this.canopy.resize(this.cols, this.rows, this.cw, this.ch, width, height);
     this.caustics.resize(this.cols, this.rows, this.cw, this.ch, width, height);
+    this.clouds.resize(this.cols, this.rows, this.cw, this.ch, width, height);
 
     for (let i = 0; i < n; i++) {
       const col = i % this.cols;
@@ -693,7 +932,7 @@ export class AsciiRenderer {
   render(world: World, dt: number) {
     const { ctx, dpr, cols, ch } = this;
     if (cols === 0) return;
-    if (world.scene !== this.scene) this.applyScene(world.scene);
+    if (world.scene !== this.scene) this.applyScene(world.scene, world);
     const t = world.time;
     windAt(t, world.windSpeed, this.wind);
     // The gust field rides on the wind; carried step by step, so it slows when the wind eases
@@ -708,6 +947,13 @@ export class AsciiRenderer {
     }
 
     this.consumeEvents(world);
+    if (this.clouds.active) {
+      // The sea of cloud rides the wind, carried step by step like the gusts; a click or the
+      // pointer leaves energy that parts it for a while.
+      this.cloudDrift.x += this.wind.x * dt;
+      this.cloudDrift.y += this.wind.y * dt;
+      this.clouds.update(t, this.cloudDrift.x, this.cloudDrift.y, this.energy);
+    }
     this.rasterizeSharks(world.sharks, t);
     this.depositWake(world, dt);
     this.diffuse(dt);
@@ -730,6 +976,7 @@ export class AsciiRenderer {
     ctx.textBaseline = "middle";
 
     this.drawCaustics();
+    this.drawClouds();
     this.drawHeat();
     this.drawFish();
     this.drawSharks(t);
@@ -788,6 +1035,11 @@ export class AsciiRenderer {
       return;
     }
     const { energy } = this;
+    if (world.scene.water === "cloud") {
+      // Nothing flying leaves a glow in the sky; a resting pointer slowly parts the clouds under it.
+      if (world.pointer.active) this.stamp(energy, world.pointer.x, world.pointer.y, 2, 0.05);
+      return;
+    }
     for (const f of world.fish) {
       if (!f.alive) continue;
       const i = this.cellIndex(f.x, f.y);
@@ -900,6 +1152,8 @@ export class AsciiRenderer {
     let bestSign = 1;
     let bestNx = 0;
     let bestNy = 0;
+    let bestTx = 1;
+    let bestTy = 0;
     for (let k = 0; k < N - 1; k++) {
       const ax = spine[k * 2];
       const ay = spine[k * 2 + 1];
@@ -917,6 +1171,8 @@ export class AsciiRenderer {
         bestSign = sx * (py - ay) - sy * (px - ax) >= 0 ? 1 : -1;
         bestNx = (-sy / len) * bestSign;
         bestNy = (sx / len) * bestSign;
+        bestTx = sx / len;
+        bestTy = sy / len;
       }
     }
 
@@ -926,7 +1182,12 @@ export class AsciiRenderer {
     const shape = this.shape;
     // A lunging whale's throat balloons out behind the open jaw.
     const swell = this.gape > 0 ? 1 + this.gape * 0.8 * (1 - smoothstep(0.05, 0.42, s)) : 1;
-    const w = shape.halfWidth(s) * L * swell;
+    let w = shape.halfWidth(s) * L * swell;
+    if (shape.lift) {
+      // A flyer's high reaches are nearer the eye, so a little wider; its low ones narrower.
+      this.hitLift = this.altitude(s);
+      w *= 1 + LIFT_SCALE * (this.hitLift - 0.5);
+    }
     this.hitDist = a;
     this.hitS = s;
     this.hitV = a * bestSign;
@@ -956,6 +1217,7 @@ export class AsciiRenderer {
       // fromBack is the distance from the dorsal midline, which slides with the roll,
       // and past the old silhouette edge the pale belly comes into view.
       const fromBack = Math.abs(across * bestSign - this.rollX);
+      if (shape.relief && s < shape.relief.to) shade = this.headLight(s, across, bestNx, bestNy, bestTx, bestTy, w, L);
       shade = Math.min(1, shade * (1 + 0.9 * smoothstep(1, 1.25, fromBack)));
       let flag = FLAG_BODY;
       if (s > shape.dorsal[0] && s < shape.dorsal[1] && fromBack < 0.3) {
@@ -970,7 +1232,7 @@ export class AsciiRenderer {
       } else if (s > shape.gills[0] && s < shape.gills[1] && across > 0.58) {
         // Five gill slits.
         if (Math.floor(((s - shape.gills[0]) / (shape.gills[1] - shape.gills[0])) * 5) % 2 === 0) shade *= 0.45;
-      } else if (s < 0.05) {
+      } else if (s < 0.05 && !shape.relief) {
         // Pale snout tip.
         shade = Math.max(shade, 0.7);
       } else if (shape === SHAPES.zebra && s > 0.08 && s < 0.55 && (across < 0.1 || Math.abs(across - 0.6) < 0.08)) {
@@ -986,6 +1248,9 @@ export class AsciiRenderer {
       this.hitShade = shade;
       return true;
     }
+    // Legs reach out over the ruff that grows at the shoulders.
+    if (shape.legs && this.inLegs(px, py, L)) return true;
+    if ((shape.horns || shape.whiskers || shape.mane) && this.inAdornment(px, py, u, a, w, s, L)) return true;
 
     // Fins are rigid: they turn with the body at the root but don't bend with it. So they're
     // tested in a straight frame pinned at the root (fu along, fa out), not in body coordinates,
@@ -1000,7 +1265,9 @@ export class AsciiRenderer {
     const pec = this.poseFin((L * (p0 + p1)) / 2, pdx * pf.tx + pdy * pf.ty, Math.abs(pcross), tip);
     const fu = pec.u;
     const fa = pec.a;
-    if (shape.flipper) {
+    if (shape.legs) {
+      // Tested above, before the ruff.
+    } else if (shape.flipper) {
       const flag = this.inFlipper(fu, fa, L, tip);
       if (flag) {
         this.hitFlag = flag;
@@ -1037,6 +1304,7 @@ export class AsciiRenderer {
     // A degenerate triangle would contain every point, so no pelvics means vr = 0 and none drawn.
     const pelvic =
       vr > 0 &&
+      !shape.legs &&
       (shape.fanFins
         ? inTriangle(vu, va, L * v0, 0, L * v1, L * vr, L * v2, L * vr * 0.8)
         : inTriangle(vu, va, L * v0, 0, L * v1, 0, L * v2, L * vr));
@@ -1056,6 +1324,254 @@ export class AsciiRenderer {
       return true;
     }
     return false;
+  }
+
+  /**
+   * The four legs, each in the straight frame at its root (along the spine tailward, out from
+   * it), posed this frame in legPose: skin for the limbs, hi-coloured fur at the elbow, strands
+   * for the claws. Sets the hit and returns true on one.
+   */
+  private inLegs(px: number, py: number, L: number) {
+    const legs = this.shape.legs!;
+    const pose = this.legPose;
+    const thick = L * legs.thick;
+    const reach = L * (legs.upper + legs.lower + legs.claw) + thick;
+    for (let hind = 0; hind < 2; hind++) {
+      const f = hind ? this.pelFrame : this.pecFrame;
+      const dx = px - f.x;
+      const dy = py - f.y;
+      if (dx * dx + dy * dy > reach * reach) continue;
+      const cross = f.tx * dy - f.ty * dx;
+      const u = dx * f.tx + dy * f.ty;
+      const out = Math.abs(cross);
+      const k = (hind * 2 + (cross >= 0 ? 0 : 1)) * LEG_POSE;
+      const eu = pose[k];
+      const ea = pose[k + 1];
+      const wu = pose[k + 2];
+      const wa = pose[k + 3];
+      // Claws over the hand they spring from, the hand over the forearm: three spread forward and
+      // a shorter one behind, on the side away from the body, as on an eagle's foot.
+      const spread = pose[k + 6];
+      for (let c = 0; c < 4; c++) {
+        const back = c === 3;
+        const dir = pose[k + 4] + (back ? (Math.sin(pose[k + 4] + 2.4) > Math.sin(pose[k + 4] - 2.4) ? 2.4 : -2.4) : (c - 1) * spread);
+        const len = L * legs.claw * (back ? 0.6 : c === 1 ? 1.1 : 1);
+        const d = this.segment(u, out, wu, wa, wu + Math.cos(dir) * len, wa + Math.sin(dir) * len);
+        if (this.segT > 0.2 && d < thick * 0.34 * (1 - 0.6 * this.segT)) {
+          this.hitFlag = FLAG_CLAW;
+          this.hitShade = 0.8 - 0.3 * this.segT;
+          return true;
+        }
+      }
+      const palm = Math.hypot(u - wu, out - wa);
+      if (palm < thick * 0.8) {
+        this.hitFlag = FLAG_BODY;
+        this.hitShade = 0.7 - 0.3 * (palm / (thick * 0.8)) ** 2;
+        return true;
+      }
+      let d = this.segment(u, out, eu, ea, wu, wa);
+      let r = thick * 0.75 * (1 - 0.2 * this.segT);
+      if (d >= r) {
+        d = this.segment(u, out, 0, 0, eu, ea);
+        r = thick * (1 - 0.25 * this.segT);
+      }
+      if (d < r) {
+        // A round limb, lit along its top.
+        this.hitFlag = FLAG_BODY;
+        this.hitShade = 0.66 - 0.36 * (d / r) ** 2;
+        return true;
+      }
+      // Fur at the elbow, streaming back.
+      const tu = eu + Math.cos(pose[k + 5]) * L * 0.05;
+      const ta = ea + Math.sin(pose[k + 5]) * L * 0.05;
+      if (this.segment(u, out, eu, ea, tu, ta) < thick * 0.85 * (1 - 0.75 * this.segT)) {
+        this.hitFlag = FLAG_HI;
+        this.hitShade = 0.7 - 0.3 * this.segT;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Distance from (u, a) to the segment from (u0, a0) to (u1, a1); where along it falls in segT. */
+  private segment(u: number, a: number, u0: number, a0: number, u1: number, a1: number) {
+    const du = u1 - u0;
+    const da = a1 - a0;
+    const t = clamp(((u - u0) * du + (a - a0) * da) / (du * du + da * da || 1), 0, 1);
+    this.segT = t;
+    return Math.hypot(u - u0 - du * t, a - a0 - da * t);
+  }
+
+  /**
+   * Pose the four legs for this frame: per leg, the elbow and wrist in its root frame, the way the
+   * claws point and how wide they spread, and the way the elbow tuft streams.
+   *
+   * A dragon flies by its body, not its legs: they don't paddle. They hold a posture, forelegs
+   * reaching forward with the claws open, hind legs trailing back, and shift it slowly, the
+   * claws closing and opening as if to grasp. Into a turn the forefoot on the inside reaches
+   * further in and the outside one draws back. The root frames follow the swimming spine, not
+   * the body wave, or the legs would swing with every S the body slides through.
+   */
+  private poseLegs(sh: Shark, L: number) {
+    const legs = this.shape.legs!;
+    const pose = this.legPose;
+    const steer = clamp(sh.turn * 1.2, -0.35, 0.35);
+    for (let leg = 0; leg < 4; leg++) {
+      const hind = leg >= 2;
+      const right = leg % 2 === 0;
+      // Diagonal legs together, a quarter apart from the other pair, so they never all move at once.
+      const q = sh.phase * LEG_RATE + (leg === 0 || leg === 3 ? 0 : Math.PI / 2);
+      // Angles from tailward toward outward: past a right angle reaches forward.
+      const reach = hind ? 0 : steer * (right ? 1 : -1);
+      const upper = hind ? 1.2 + 0.08 * Math.sin(q) : 1.5 + 0.1 * Math.sin(q) + reach;
+      const lower = hind ? upper - 0.7 + 0.06 * Math.sin(q - 1) : upper + 0.55 + 0.08 * Math.sin(q - 1) + reach * 0.5;
+      const k = leg * LEG_POSE;
+      pose[k] = Math.cos(upper) * L * legs.upper;
+      pose[k + 1] = Math.sin(upper) * L * legs.upper;
+      pose[k + 2] = pose[k] + Math.cos(lower) * L * legs.lower;
+      pose[k + 3] = pose[k + 1] + Math.sin(lower) * L * legs.lower;
+      pose[k + 4] = lower;
+      pose[k + 5] = 0.25 + 0.1 * Math.sin(q - 0.6);
+      // The grip: claws spread wide, then draw in, slowly.
+      pose[k + 6] = 0.42 + 0.14 * Math.sin(q * 0.7 + leg);
+    }
+  }
+
+  /** Steady the leg roots' frames: their tangent from the swimming spine, not the waving one. */
+  private steadyLegFrames(sh: Shark) {
+    const n = sh.nodes;
+    for (const [frame, s] of [
+      [this.pecFrame, (this.shape.pectoral[0] + this.shape.pectoral[1]) / 2],
+      [this.pelFrame, (this.shape.pelvic[0] + this.shape.pelvic[1]) / 2],
+    ] as const) {
+      const k = clamp(Math.round(s * (SHARK_NODES - 1)), 1, SHARK_NODES - 2);
+      const tx = n[(k + 1) * 2] - n[(k - 1) * 2];
+      const ty = n[(k + 1) * 2 + 1] - n[(k - 1) * 2 + 1];
+      const len = Math.hypot(tx, ty) || 1;
+      frame.tx = tx / len;
+      frame.ty = ty / len;
+    }
+  }
+
+  /**
+   * A dragon's horns, barbels, and the tufts its mane flares into past the flanks, at (u along,
+   * a out from the spine) where the body's half-width is w. Sets the hit and returns true on one.
+   */
+  private inAdornment(px: number, py: number, u: number, a: number, w: number, s: number, L: number) {
+    const { horns, whiskers, mane } = this.shape;
+    if (horns) {
+      const du = L * (horns.u1 - horns.u0);
+      const da = L * (horns.a1 - horns.a0);
+      const pu = u - L * horns.u0;
+      const pa = a - L * horns.a0;
+      const t = (pu * du + pa * da) / (du * du + da * da);
+      if (t > 0 && t < 1 && Math.abs(pu * da - pa * du) / Math.hypot(du, da) < L * horns.width * (1 - 0.75 * t)) {
+        this.hitFlag = FLAG_PALE;
+        this.hitShade = 0.75 - 0.3 * t;
+        return true;
+      }
+    }
+    if (whiskers) {
+      const t = (u - L * whiskers.u) / (L * whiskers.length);
+      if (t > 0 && t < 1) {
+        // Streaming back and out, a ripple running down them toward the free end, which waves most.
+        // They flare out at once from the muzzle, clear of the cheeks, then run back.
+        const along = L * (whiskers.a + whiskers.spread * (1 - (1 - t) ** 2) + whiskers.wave * t * Math.sin(t * 7 + this.flutter * 1.4));
+        // About a cell wide, so a barbel at a slant still lands on a cell centre all the way along.
+        if (Math.abs(a - along) < this.cw * 0.8 * (1 - 0.5 * t)) {
+          // A solid line of light near the root, thinning to a thread toward the tip.
+          this.hitFlag = t < WHISKER_SOLID ? FLAG_WHISKER : FLAG_STRAND;
+          this.hitShade = t < WHISKER_SOLID ? 0.9 : 1 - t;
+          return true;
+        }
+      }
+    }
+    if (mane && this.inTailLocks(px, py, L)) return true;
+    if (mane && s > mane.ruff[0] && s < mane.ruff[1]) {
+      // A ruff behind the head, in tufts that stream toward the tail. Solid jade, lit like the
+      // mane: drawn as a fin membrane, its thin ends let the sky through and went murky.
+      const [r0, r1] = mane.ruff;
+      const neck = smoothstep(r0, r0 + 0.02, s) * (1 - smoothstep(r0 + 0.05, r1, s));
+      const tuft = Math.max(0, Math.sin(s * 120 + this.flutter)) ** 2;
+      const fringe = L * mane.size * neck * (0.6 + 0.4 * tuft);
+      if (a < w + fringe) {
+        this.hitFlag = FLAG_HI;
+        this.hitShade = 0.75 - 0.4 * ((a - w) / Math.max(1, fringe));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The tail's locks of hair, tested in a frame at the tail's end (along it tailward, across it
+   * signed) so they run on past the tip: each fans out from a little before the tip, rippling
+   * as it streams, solid near the root and a thread at the end. A filled plume blurred into one
+   * mass; separate locks keep the flow of the hair.
+   */
+  private inTailLocks(px: number, py: number, L: number) {
+    const { count, length, spread } = this.shape.mane!.tail;
+    const f = this.tailFrame;
+    const dx = px - f.x;
+    const dy = py - f.y;
+    const along = dx * f.tx + dy * f.ty + L * TAIL_ROOT;
+    if (along < 0 || along > L * (length + TAIL_ROOT)) return false;
+    const across = f.tx * dy - f.ty * dx;
+    // Past the tip the hair keeps to the S the body slides along: the body wave carried on beyond
+    // the tip, less the straight line the tail already points along. Pinned straight to the tip,
+    // the locks stuck out like an ornament while the body swam on through its curves.
+    const past = Math.max(0, along - L * TAIL_ROOT) / L;
+    const k1 = this.tailWave.k;
+    const at = this.tailWave.phase - k1;
+    const flow = -this.tailWave.amp * (Math.sin(at - k1 * past) - Math.sin(at) + Math.cos(at) * k1 * past);
+    for (let k = 0; k < count; k++) {
+      const side = k - (count - 1) / 2;
+      const len = L * (length + TAIL_ROOT) * (1 - 0.18 * Math.abs(side));
+      const t = along / len;
+      if (t >= 1) continue;
+      const lane = flow + L * (spread * (side / ((count - 1) / 2)) * t * t + 0.01 * t * Math.sin(t * 6 + this.flutter * 1.3 + k * 1.7));
+      if (Math.abs(across - lane) < this.cw * 0.85 * (1 - 0.45 * t) + 1) {
+        this.hitFlag = t < HAIR_SOLID ? FLAG_HAIR : FLAG_HAIR_END;
+        this.hitShade = t < HAIR_SOLID ? 0.75 - 0.3 * t : 1 - t;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Light on a head modelled as a surface (shape.relief), at s along the body and `across` its
+   * half-width w, with n the outward normal across the body and t the tailward tangent there.
+   * The height is a rounded skull, 1 − across², plus a ridge down the middle (the bridge of the
+   * nose) and brows over the eyes; the light is Lambert on that surface's slopes for a sun at
+   * HEAD_SUN up from the horizon, from the scene's side. Shaded as the body's tube, the head was
+   * one even tone from the midline to the edges, and read flat.
+   */
+  private headLight(s: number, across: number, nx: number, ny: number, tx: number, ty: number, w: number, L: number) {
+    const { relief, eye } = this.shape;
+    const { ridge, brow } = relief!;
+    const eyeS = eye ? (eye[0] + eye[1]) / 2 : 0;
+    const r = Math.exp(-((across / 0.2) ** 2));
+    const b = Math.exp(-(((across - 0.5) / 0.18) ** 2) - ((s - eyeS) / 0.014) ** 2);
+    // Height per unit across, and per unit s; the head stands about its own half-width high.
+    const dAcross = -2 * across - ridge * r * ((2 * across) / 0.04) - brow * b * ((2 * (across - 0.5)) / 0.0324);
+    const dS = -brow * b * ((2 * (s - eyeS)) / 0.000196);
+    // Slopes in px per px: across the half-width w, and along the length L.
+    const gx = dAcross * nx * HEAD_HEIGHT + ((dS * w) / L) * tx * HEAD_HEIGHT;
+    const gy = dAcross * ny * HEAD_HEIGHT + ((dS * w) / L) * ty * HEAD_HEIGHT;
+    // The surface normal is (−g, 1); the sun comes from (lightX, lightY) and HEAD_SUN up.
+    const up = Math.sin(HEAD_SUN);
+    const side = Math.cos(HEAD_SUN);
+    const lambert = ((-gx * this.lightX - gy * this.lightY) * side + up) / Math.sqrt(1 + gx * gx + gy * gy);
+    // Flat top about as bright as the body's lit back (0.8); faces turned well away down to 0.25.
+    return clamp(0.43 + 0.58 * lambert, 0, 1);
+  }
+
+  /** The current flyer's height at s along its body, in the cloud tops' 0–1. */
+  private altitude(s: number) {
+    const lift = this.shape.lift!;
+    const body = lift.mid + lift.swing * Math.sin(this.liftPhase - lift.k * s);
+    return lift.head + (body - lift.head) * smoothstep(0.03, 0.25, s);
   }
 
   /**
@@ -1137,6 +1653,11 @@ export class AsciiRenderer {
 
   /** Skin pattern at a body point (s along, v across): 0 for plain skin, FLAG_MARK (dark) or FLAG_HI (koi red). */
   private marking(s: number, v: number, L: number, across: number) {
+    const mane = this.shape.mane;
+    if (mane) {
+      // The mane down the back, one unbroken line from the crown to the tail tuft.
+      return s > mane.from && s < 0.94 && across < mane.strip ? FLAG_HI : 0;
+    }
     if (this.shape === SHAPES.tiger) {
       // Wavy vertical bars over the back half, fading out toward the head.
       if (s < 0.2 || s > 0.9 || across > 0.85) return 0;
@@ -1188,10 +1709,14 @@ export class AsciiRenderer {
    * Fully covered cells become solid skin; partial cells become edge glyphs.
    */
   private rasterizeSharks(sharks: Shark[], t: number) {
-    const { sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow, floorShade, spine, arc, cw, ch, cols, rows } = this;
+    const { sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow, sharkMist, floorShade, clouds, spine, arc, cw, ch, cols, rows } = this;
     sharkFlag.fill(0);
     sharkShadow.fill(0);
     floorShade.fill(0);
+    if (clouds.active) {
+      clouds.shadow.fill(0);
+      clouds.veil.fill(0);
+    }
     const floor = !!this.scene?.floorShadow;
 
     for (const sh of sharks) {
@@ -1203,6 +1728,14 @@ export class AsciiRenderer {
       this.sharkId = sh.id;
       this.gape = sh.gape;
       const kindIndex = KINDS.indexOf(sh.kind);
+      this.flutter = -t * 2.2;
+      const lift = this.shape.lift;
+      // The height wave keeps still in space along with the body wave, so its phase runs at
+      // its own wavenumber's share of the body wave's.
+      if (lift) this.liftPhase = (sh.phase * lift.k) / (this.shape.wave?.[2] ?? SLITHER_K);
+      this.hitLift = 1;
+      const cloudy = clouds.active && !!lift;
+      if (this.shape.legs) this.poseLegs(sh, L);
 
       // Travelling body wave, growing toward the tail.
       for (let k = 0; k < N; k++) {
@@ -1230,6 +1763,14 @@ export class AsciiRenderer {
       const { pectoral, pelvic } = this.shape;
       this.spineFrame((pectoral[0] + pectoral[1]) / 2, this.pecFrame);
       this.spineFrame((pelvic[0] + pelvic[1]) / 2, this.pelFrame);
+      if (this.shape.legs) this.steadyLegFrames(sh);
+      if (this.shape.mane) {
+        this.spineFrame(1 - TAIL_ROOT * 0.2, this.tailFrame);
+        const [waveAmp, , waveK] = this.shape.wave ?? [0.05, 1.8, 5.2];
+        this.tailWave.amp = L * waveAmp * swim;
+        this.tailWave.phase = sh.phase;
+        this.tailWave.k = waveK;
+      }
       const motion = this.shape.finMotion ?? DEFAULT_FIN_MOTION;
       const flapPhase = sh.phase * motion.flap[1];
       // A fin grows out of the body, so sweeping its root back buries more of it under the
@@ -1262,7 +1803,7 @@ export class AsciiRenderer {
         maxY = Math.max(maxY, spine[k * 2 + 1]);
       }
       // Wide enough for the longest flipper even when it levels out in a bank.
-      const reach = L * Math.max(0.36, this.shape.pectoral[3] / Math.cos(PECTORAL_DROOP) + 0.02);
+      const reach = L * (this.shape.extent ?? Math.max(0.36, this.shape.pectoral[3] / Math.cos(PECTORAL_DROOP) + 0.02));
       const c0 = Math.max(0, Math.floor((minX - reach) / cw));
       const c1 = Math.min(cols - 1, Math.floor((maxX + reach) / cw));
       const r0 = Math.max(0, Math.floor((minY - reach) / ch));
@@ -1289,6 +1830,7 @@ export class AsciiRenderer {
           const shade = this.hitShade;
           const s = this.hitS;
           const v = this.hitV;
+          const height = this.hitLift;
 
           let hits = centerHit ? 1 : 0;
           for (let k = 0; k < SUBSAMPLES.length; k += 2) {
@@ -1298,7 +1840,32 @@ export class AsciiRenderer {
           const coverage = hits / 5;
 
           const i = r * cols + c;
-          const solid = centerHit && coverage >= 0.6;
+          let mist = 0;
+          let inCloud = false;
+          if (cloudy) {
+            const top = clouds.hide[i];
+            if (top > 0) {
+              const under = top - height;
+              if (under > 0) {
+                // In the cloud: veiled the deeper it goes, and gone only where the cloud is thick
+                // and the body well down in it. Thin cloud never hides it outright.
+                const veil = smoothstep(0, VEIL_DEPTH, under) * smoothstep(0, VEIL_THICK, top);
+                if (veil > 0.999) {
+                  clouds.veil[i] = 1;
+                  continue;
+                }
+                mist = MIST_TOP + (MIST_DEEP - MIST_TOP) * veil;
+                inCloud = true;
+              } else {
+                // Skimming the tops: the mist thins out above them.
+                mist = MIST_TOP * (1 - smoothstep(0, MIST_BAND, -under));
+              }
+            }
+          }
+          // A strand, claw or lock never covers enough of a cell to be solid; its centre crossing it is enough.
+          const solid =
+            centerHit &&
+            (coverage >= 0.6 || flag === FLAG_STRAND || flag === FLAG_CLAW || flag === FLAG_WHISKER || flag === FLAG_HAIR || flag === FLAG_HAIR_END);
           // Sharks are drawn deepest first. Where this one's soft edge crosses a deeper body,
           // keep that body and shade it instead: a dark rim, not a hole punched through it.
           if (!solid && sharkFlag[i] && sharkFlag[i] !== FLAG_EDGE) {
@@ -1310,6 +1877,7 @@ export class AsciiRenderer {
           sharkKey[i] = key;
           sharkDepth[i] = sh.depth;
           sharkKind[i] = kindIndex;
+          sharkMist[i] = mist;
 
           if (solid) {
             sharkFlag[i] = flag;
@@ -1321,7 +1889,12 @@ export class AsciiRenderer {
               const j = sr * cols + sc;
               sharkShadow[j] = Math.max(sharkShadow[j], sh.depth);
             }
-            if (floor) this.castOnFloor(c + floorDc, r + floorDr, floorDark);
+            if (floor) this.castOn(floorShade, c + floorDc, r + floorDr, floorDark);
+            if (cloudy && !inCloud) {
+              // Sunlight past a flyer lands on the tops below, the further off the higher it flies.
+              const drop = (height - Math.max(0, clouds.hide[i])) * LIFT_SHADOW * L;
+              this.castOn(clouds.shadow, c + Math.round((-this.lightX * drop) / cw), r + Math.round((-this.lightY * drop) / ch), 1);
+            }
           } else {
             sharkFlag[i] = FLAG_EDGE;
             sharkShade[i] = coverage;
@@ -1331,9 +1904,9 @@ export class AsciiRenderer {
     }
   }
 
-  /** Lay a soft shadow on the floor around cell (c, r): full in the cell, half beside it. */
-  private castOnFloor(c: number, r: number, dark: number) {
-    const { cols, rows, floorShade } = this;
+  /** Lay a soft shadow in `field` around cell (c, r): full in the cell, half beside it. */
+  private castOn(field: Float32Array, c: number, r: number, dark: number) {
+    const { cols, rows } = this;
     for (let dr = -1; dr <= 1; dr++) {
       for (let dc = -1; dc <= 1; dc++) {
         const cc = c + dc;
@@ -1341,7 +1914,7 @@ export class AsciiRenderer {
         if (cc < 0 || rr < 0 || cc >= cols || rr >= rows) continue;
         const j = rr * cols + cc;
         const v = (dc === 0 && dr === 0 ? 1 : dc === 0 || dr === 0 ? 0.5 : 0.25) * dark;
-        if (v > floorShade[j]) floorShade[j] = v;
+        if (v > field[j]) field[j] = v;
       }
     }
   }
@@ -1397,6 +1970,46 @@ export class AsciiRenderer {
   }
 
 
+  /**
+   * The cloud sea, per cell in the two channels everything else here uses. The fill is the
+   * cloud's brightness: the sunlight on its face, darkened where a flyer's shadow falls, thinned
+   * toward the sky at the wisps of an edge. It covers the whole cell, grid line and all, so the
+   * cloud reads as one soft mass, apart from the tiled scales of the creatures. Over it a glyph
+   * in a darker ink, sparse on the lit faces and dense in their shade, as on the skins, gives the
+   * billows their grain. Not where a creature is in view over it.
+   */
+  private drawClouds() {
+    const { ctx, clouds, cols, cw, ch, sharkFlag, cloudBuckets, cloudStyles } = this;
+    if (!clouds.active || !cloudStyles.length) return;
+    const { top, lit, shadow, veil } = clouds;
+    for (const bucket of cloudBuckets) bucket.length = 0;
+    for (let i = 0; i < top.length; i++) {
+      const tp = top[i];
+      if ((tp <= 0 && !veil[i]) || sharkFlag[i]) continue;
+      const light = 0.15 + 0.85 * lit[i] * (1 - CLOUD_SHADOW * shadow[i]);
+      // Half a step of dither per cell, so an even face doesn't print as one flat patch.
+      const dither = hash3(i, 3, 41) - 0.5;
+      let level = Math.floor(smoothstep(0, CLOUD_BODY, tp) * light * CLOUD_LEVELS + dither);
+      // Where it hides part of a creature the cloud must show, or the creature just has a hole.
+      if (veil[i]) level = Math.max(level, CLOUD_VEIL);
+      if (level > 0) cloudBuckets[Math.min(CLOUD_LEVELS - 1, level)].push(i);
+    }
+    for (let b = 1; b < CLOUD_LEVELS; b++) {
+      const bucket = cloudBuckets[b];
+      if (!bucket.length) continue;
+      ctx.fillStyle = cloudStyles[b];
+      for (const i of bucket) ctx.fillRect((i % cols) * cw, ((i / cols) | 0) * ch, cw, ch);
+    }
+    for (let b = 1; b < CLOUD_LEVELS; b++) {
+      const bucket = cloudBuckets[b];
+      if (!bucket.length) continue;
+      // The ink sits a few steps below the fill; brighter faces take less of it.
+      ctx.fillStyle = cloudStyles[Math.max(0, b - CLOUD_INK)];
+      const glyph = CLOUD_GLYPHS[Math.floor((1 - b / CLOUD_LEVELS) * CLOUD_GLYPHS.length)];
+      for (const i of bucket) ctx.fillText(glyph, (i % cols) * cw + cw / 2, ((i / cols) | 0) * ch + ch / 2 + 1);
+    }
+  }
+
   /** Sunlight reaching cell i through the canopy, as much of its shade as falls now. */
   private sunAt(i: number) {
     return this.shadeAmount > 0.001 ? 1 - (1 - this.canopy.sun[i]) * this.shadeAmount : 1;
@@ -1416,8 +2029,50 @@ export class AsciiRenderer {
     }
   }
 
+  /**
+   * Glyphs sorted by how much ink they lay in this font, measured rather than guessed: each is
+   * drawn large and its coverage summed. INK_STEPS are kept, evenly spaced from the sparsest to
+   * the densest, so the step from one to the next is the same in tone all along the ramp.
+   */
+  private measureInk() {
+    const key = `${this.fontFamily}|${document.fonts?.status ?? ""}`;
+    if (key === this.inkFont) return;
+    this.inkFont = key;
+    const size = 48;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = Math.round(size * 1.45);
+    const g = canvas.getContext("2d", { willReadFrequently: true });
+    if (!g) return;
+    g.font = `600 ${Math.round(size * 0.74 * 1.45)}px ${this.fontFamily}`;
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    const inks = [...INK_CANDIDATES].map((glyph) => {
+      g.clearRect(0, 0, canvas.width, canvas.height);
+      g.fillText(glyph, canvas.width / 2, canvas.height / 2);
+      const data = g.getImageData(0, 0, canvas.width, canvas.height).data;
+      let sum = 0;
+      for (let k = 3; k < data.length; k += 4) sum += data[k];
+      return { glyph, ink: sum };
+    });
+    inks.sort((a, b) => a.ink - b.ink);
+    // The blank leaves a cell bare; the ramp starts at the first glyph with any ink.
+    const marks = inks.filter((m) => m.ink > 0);
+    const lo = marks[0].ink;
+    const hi = marks[marks.length - 1].ink;
+    let ramp = "";
+    for (let k = 0; k < INK_STEPS; k++) {
+      const want = lo + ((hi - lo) * k) / (INK_STEPS - 1);
+      let best = marks[0];
+      for (const m of marks) if (!ramp.includes(m.glyph) && Math.abs(m.ink - want) < Math.abs(best.ink - want)) best = m;
+      if (!ramp.includes(best.glyph)) ramp += best.glyph;
+    }
+    this.inkRamp = ramp;
+  }
+
   private drawSharks(t: number) {
     const { ctx, cols, rows, cw, ch, sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow } = this;
+    this.measureInk();
     const n = cols * rows;
     for (let i = 0; i < n; i++) {
       const flag = sharkFlag[i];
@@ -1433,24 +2088,34 @@ export class AsciiRenderer {
       const shadowed = sharkShadow[i] > depth + 0.001;
       // A pale floor's fill light softens the shadow one fish casts on another.
       const dim = (0.7 + 0.3 * depth) * (shadowed ? SHADOW + (1 - SHADOW) * this.ambient : 1);
-      const fog = clamp((1 - depth) * FOG_RATE, 0, FOG_MAX) * this.fogStrength;
+      // Deep water and the mist of cloud tops skimmed are the same veil, whichever is thicker.
+      const fog = Math.max(clamp((1 - depth) * FOG_RATE, 0, FOG_MAX) * this.fogStrength, this.sharkMist[i]);
       const [fogR, fogG, fogB] = this.fogRGB;
       // Glyphs fade into their own cell (or the water, for edges) as the creature goes deeper.
       ctx.globalAlpha = 1 - fog * 0.7;
       const shape = SHAPES[KINDS[sharkKind[i]]];
       const [tr, tg, tb] =
-        flag === FLAG_HI
-          ? HI_TINT
-          : flag === FLAG_PALE
+        flag === FLAG_HI || flag === FLAG_HAIR
+          ? (shape.hiTint ?? HI_TINT)
+          : flag === FLAG_PALE || flag === FLAG_CLAW
             ? (shape.pectoralTint ?? shape.tint)
             : flag === FLAG_FIN && shape.glossy
-              ? GLOSSY_FIN_TINT
+              ? (shape.finTint ?? GLOSSY_FIN_TINT)
               : shape.tint;
 
       // Colours re-roll on a staggered clock so the hide shimmers.
       const tick = Math.floor(t * 2.4 + (key % 997) / 97);
       const roll = hash3(key, tick, 7);
 
+      if (flag === FLAG_STRAND || flag === FLAG_HAIR_END) {
+        // A thread of light: near white for a barbel, jade for a lock of hair, a little brighter
+        // toward the root. Dimmer, on a bright sky they read as grey specks.
+        const [pr, pg, pb] = flag === FLAG_HAIR_END ? (shape.hiTint ?? HI_TINT) : shape.tint;
+        const g = (190 + shade * 40) * dim;
+        ctx.fillStyle = `rgb(${Math.min(255, Math.round(g * pr + (fogR - g * pr) * fog))},${Math.min(255, Math.round(g * pg + (fogG - g * pg) * fog))},${Math.min(255, Math.round(g * pb + (fogB - g * pb) * fog))})`;
+        ctx.fillText(STRAND_GLYPHS[Math.min(STRAND_GLYPHS.length - 1, Math.floor(shade * STRAND_GLYPHS.length))], x + cw / 2, y + ch / 2 + 1);
+        continue;
+      }
       if (flag === FLAG_EDGE) {
         // Soft, anti-aliased silhouette: no block, just a light glyph.
         const set = shade >= 0.5 ? EDGE_HEAVY : EDGE_LIGHT;
@@ -1489,8 +2154,14 @@ export class AsciiRenderer {
       } else {
         level = 46 + shade * 160;
         const jitter = ((key >>> 4) % 3) - 1;
-        const ramp = shape.glossy ? GLOSSY_RAMP : SKIN_RAMP;
-        glyph = ramp[clamp(Math.floor((1 - shade) * (ramp.length - 0.01)) + jitter, 0, ramp.length - 1)];
+        const ramp = shape.measuredInk ? this.inkRamp : shape.glossy ? GLOSSY_RAMP : SKIN_RAMP;
+        // Claws and barbels are extremities, fine at the ends: the sparse third of the ramp.
+        const span = flag === FLAG_CLAW || flag === FLAG_WHISKER ? ramp.length / 3 : ramp.length;
+        // On a measured ramp, ink rises steeply only into the shade, as in ASCII art: most of a lit
+        // body stays sparse and its shaded flank turns dense, which is what gives it volume. Taken
+        // straight, the lit middle of a round body landed mid-ramp and the whole dragon went grey.
+        const ink = shape.measuredInk ? Math.pow(1 - shade, INK_CURVE) : 1 - shade;
+        glyph = ramp[clamp(Math.floor(ink * (span - 0.01)) + jitter, 0, Math.ceil(span) - 1)];
       }
       level *= dim;
       // Fill light from a pale floor lifts unlit skin most and lit skin least. Pigment (black
@@ -1514,12 +2185,13 @@ export class AsciiRenderer {
       ctx.globalAlpha = 1 - fog * 0.7;
 
       let color: string;
-      if (flag === FLAG_EYE) color = "#9aa0ad";
+      if (flag === FLAG_EYE) color = shape.eyeInk ?? "#9aa0ad";
       else if (flag === FLAG_MARK) color = `rgb(${Math.round(70 * tr)},${Math.round(70 * tg)},${Math.round(70 * tb)})`;
       else if (roll < 0.09) color = this.accents[key % this.accents.length];
       else if (roll < 0.13) color = "#ffffff";
       else if (shape.glossy) {
-        color = `rgb(${Math.round(skinR * GLOSSY_INK)},${Math.round(skinG * GLOSSY_INK)},${Math.round(skinB * GLOSSY_INK)})`;
+        const inkK = shape.measuredInk ? MEASURED_INK : GLOSSY_INK;
+        color = `rgb(${Math.round(skinR * inkK)},${Math.round(skinG * inkK)},${Math.round(skinB * inkK)})`;
       } else color = shade > 0.55 ? "#0e0f13" : "#1b1d24";
       ctx.fillStyle = color;
       ctx.fillText(glyph, x + cw / 2, y + ch / 2 + 1);
@@ -1615,6 +2287,8 @@ export class AsciiRenderer {
   private drawDots(t: number) {
     const { ctx, cols, rows, cw, ch, dotKind, dotPhase, dotFreq, energy, sharkFlag, sharkShadow, fishStamp, frameId } = this;
     const { bucketOf, bucketOrder, bucketCounts } = this;
+    // A cloud sea's field only parts the clouds; it never glows.
+    if (this.scene?.water === "cloud") return;
     const n = cols * rows;
     const SKIP = bucketCounts.length - 1;
     bucketCounts.fill(0);

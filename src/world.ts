@@ -21,10 +21,19 @@ export const SHARK_NODES = 20;
 
 export type SharkKind =
   | "classic" | "hammerhead" | "zebra" | "tiger" | "greathammer" | "mako" | "thresher" | "nurse"
-  | "koi" | "humpback";
+  | "koi" | "humpback" | "dragon";
 
-/** Which sharks to put in the water; size is relative to the biggest. */
-export type SharkSpec = { kind: SharkKind; size: number };
+/**
+ * Which sharks to put in the water; size is relative to the biggest. Depth (0 far → 1 near)
+ * follows size unless given: a dragon is several times a shark's length but no nearer.
+ */
+export type SharkSpec = { kind: SharkKind; size: number; depth?: number };
+
+/**
+ * A dragon's body wave: its wavenumber along the body (radians per length), two S-bends from
+ * neck to tail. The renderer draws the wave; the sim runs its phase.
+ */
+export const SLITHER_K = 12.5;
 
 export interface Fish {
   x: number;
@@ -139,6 +148,12 @@ const BLIND_COS = -0.6; // ~127° either side of the heading is visible
  * follows the path the head took, like a train on rails: a flick of the head leaves a corner
  * the body holds until it has swum a whole length past it, which reads as a stiff C. A real
  * fish's body is elastic: the tail sweeps round to line up with the head, cutting the corner.
+ * `stride`: a meanderer's next waypoint lies this many lengths off (shortest, longest), and it
+ * counts as reached within the third value. A koi is a quarter of the pond; a dragon spans it.
+ * `cruise`: scales the cruising speed every kind shares (30 px/s plus 4% of its length a second).
+ * `slither`: the body wave's wavenumber when the wave stands still in space, its phase running
+ * at speed · k / L, so the body slides along one S-shaped path like a snake's instead of
+ * beating like a fish's tail.
  */
 interface Motion {
   turnRadius: number;
@@ -150,15 +165,26 @@ interface Motion {
   pivot: number;
   relax: number;
   push: number;
+  stride: [number, number, number];
+  cruise?: number;
+  slither?: number;
 }
 const SHARK_MOTION: Motion = {
   turnRadius: 0.22, bend: 0.16, idleRate: 0.8, meander: false, accel: 1.1, space: 0.45, pivot: 0, relax: 0, push: 1,
+  stride: [1, 2.2, 0.6],
 };
 const MOTION: Partial<Record<SharkKind, Motion>> = {
   // Supple: the body curls to about L/4, so a koi flicks round and glides on. Quick off the
   // mark for food, and happy to swim close to the others.
   koi: {
     turnRadius: 0.24, bend: 0.22, idleRate: 2.6, meander: true, accel: 3.5, space: 0.16, pivot: 2.6, relax: 3, push: 0.25,
+    stride: [1, 2.2, 0.6],
+  },
+  // Soars: long sweeping arcs from one waypoint half its length off to the next, never a flick.
+  // Its S comes from the body wave sliding along the path, not from the turns.
+  dragon: {
+    turnRadius: 0.3, bend: 0.2, idleRate: 0.45, meander: true, accel: 0.8, space: 0.3, pivot: 0, relax: 0.5, push: 1,
+    stride: [0.45, 0.8, 0.22], cruise: 1.6, slither: SLITHER_K,
   },
 };
 /**
@@ -290,7 +316,7 @@ export class World {
 
     this.sharks = [];
     for (let i = 0; i < sharkCount; i++) {
-      const { kind, size } = sharkSpecs[i];
+      const { kind, size, depth = size } = sharkSpecs[i];
       const length = baseLength * size;
       const orbitRadius = minSide * rand(0.28, 0.4);
       const a = (i / sharkCount) * TAU + rand(-0.4, 0.4);
@@ -319,7 +345,7 @@ export class World {
         orbitRadius,
         target: null,
         retargetAt: 0,
-        depth: size,
+        depth,
         gape: 0,
         swept: 0,
         ringAngle: 0,
@@ -848,9 +874,12 @@ export class World {
 
       // Turn back once the snout leaves the frame, so bodies dip off-screen
       // now and then but the sharks never wander away for good.
+      // Measured on the body or the screen, whichever is smaller: a dragon longer than the screen
+      // is wide would otherwise stray half a screen out before turning back.
+      const reachIn = Math.min(L, Math.min(W, H));
       const over = Math.max(-hx, hx - W, -hy, hy - H);
-      if (over > -L * 0.05) {
-        const w = clamp((over + L * 0.05) / (L * 0.35), 0, 1) * 3.5;
+      if (over > -reachIn * 0.05) {
+        const w = clamp((over + reachIn * 0.05) / (reachIn * 0.35), 0, 1) * 3.5;
         if (motion.meander) {
           // Straight off the wall it's nosing into. Steering every koi that reaches a wall at
           // the one centre point would gather the whole pond there.
@@ -885,7 +914,7 @@ export class World {
       sh.heading += turned;
       sh.turn += (turned / dt - sh.turn) * Math.min(1, dt * 3);
 
-      const cruise = 30 + L * 0.04;
+      const cruise = (30 + L * 0.04) * (motion.cruise ?? 1);
       sh.burst *= Math.exp(-dt * 0.9);
       if (motion.meander) {
         // Excitement, not distance to the next pellet, sets a koi's pace: it stays up between
@@ -903,7 +932,7 @@ export class World {
         const targetSpeed = bubbleNet ? cruise * pace : hunting ? cruise * (1.45 + closing * 1.5) : cruise;
         sh.speed += (targetSpeed - sh.speed) * Math.min(1, dt * motion.accel);
       }
-      sh.phase += dt * (2 + sh.speed / 24);
+      sh.phase += dt * (motion.slither ? (sh.speed * motion.slither) / L : 2 + sh.speed / 24);
 
       nodes[0] += Math.cos(sh.heading) * sh.speed * dt;
       nodes[1] += Math.sin(sh.heading) * sh.speed * dt;
@@ -986,8 +1015,11 @@ export class World {
     const L = sh.length;
     const hx = sh.nodes[0];
     const hy = sh.nodes[1];
-    if (time >= sh.goalAt || Math.hypot(sh.goalX - hx, sh.goalY - hy) < L * 0.6) {
-      const m = Math.min(W, H) * 0.12;
+    const motion = MOTION[sh.kind] ?? SHARK_MOTION;
+    const [near, far, reached] = motion.stride;
+    if (time >= sh.goalAt || Math.hypot(sh.goalX - hx, sh.goalY - hy) < L * reached) {
+      // Room to swing round inside the frame: a dragon turns on a circle a third of the screen wide.
+      const m = Math.max(Math.min(W, H) * 0.12, Math.min(L * motion.turnRadius, Math.min(W, H) * 0.4));
       // Of a few headings off to either side, take the one whose waypoint lands furthest from
       // the other koi, so the pond stays spread out and a crowd breaks up after feeding.
       // Waypoints are one to two lengths off: a koi is a quarter of the pond wide, and further
@@ -997,7 +1029,7 @@ export class World {
       let roomiest = -1;
       for (let tries = 0; tries < 4; tries++) {
         const a = sh.heading + (Math.random() < 0.5 ? 1 : -1) * rand(0.3, 1.9);
-        const d = rand(1, 2.2) * L;
+        const d = rand(near, far) * L;
         const x = clamp(hx + Math.cos(a) * d, m, W - m);
         const y = clamp(hy + Math.sin(a) * d, m, H - m);
         let room = Infinity;

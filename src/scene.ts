@@ -1,5 +1,6 @@
 import { ENKIANTHUS, type Canopy } from "./canopy";
 import { POND_CAUSTICS, type Caustics } from "./caustics";
+import { SUNLIT_CLOUDS, type Clouds } from "./clouds";
 import { KRILL_SPECIES, OCEAN_SPECIES, POND_SPECIES, type Species } from "./species";
 import type { SharkSpec } from "./world";
 
@@ -42,8 +43,11 @@ export interface Scene {
   click: "scatter" | "feed";
   /** Raindrops per second. */
   rain: number;
-  /** A glowing wake that diffuses, or a surface that carries ripples as waves. */
-  water: "wake" | "ripple";
+  /**
+   * A glowing wake that diffuses, a surface that carries ripples as waves, or a cloud sea, where
+   * the same diffusing field shows no glow and only parts the clouds where a click lands.
+   */
+  water: "wake" | "ripple" | "cloud";
   /** Ripples bounce off the edges like a pond wall; without a shore they run out to open sea. */
   shore: boolean;
   /** Surface drift from the wind, px/s (gusting, its bearing wandering); 0 for still water. */
@@ -69,6 +73,11 @@ export interface Scene {
    * the ripples themselves; null where there is no sun, or no floor to see it on.
    */
   caustics: Caustics | null;
+  /**
+   * A sea of cloud below the creatures: what flies lower than its tops is hidden in it, what
+   * flies above casts a shadow on it. Null where there is open water instead.
+   */
+  clouds: Clouds | null;
   /** A light-mode palette, for scenes that have one: the same water by day, not inverted. */
   daylight?: Palette;
 }
@@ -76,7 +85,7 @@ export interface Scene {
 /** Everything a theme can recolour; the cast, the physics and the light direction stay put. */
 export type Palette = Pick<
   Scene,
-  | "background" | "grid" | "wake" | "fog" | "fogStrength" | "ambient" | "fish" | "accents" | "food" | "floorShadow" | "canopy" | "caustics"
+  | "background" | "grid" | "wake" | "fog" | "fogStrength" | "ambient" | "fish" | "accents" | "food" | "floorShadow" | "canopy" | "caustics" | "clouds"
 >;
 
 export type Theme = "dark" | "light";
@@ -119,6 +128,7 @@ export const OCEAN: Scene = {
   floorShadow: null,
   canopy: null,
   caustics: null,
+  clouds: null,
 };
 
 // Koi circling dark green water, a few ricefish, rain on the surface. A click drops food
@@ -158,6 +168,7 @@ export const KOI_POND: Scene = {
   floorShadow: null,
   canopy: null,
   caustics: null,
+  clouds: null,
   // By day: a clear, shallow pond over pale stone. The koi keep their light and shading; what
   // changes is what lies under them. The floor shows through, deeper koi fade toward the pale
   // water, ripples read darker than the floor, and every koi casts a soft shadow on the bottom,
@@ -178,6 +189,7 @@ export const KOI_POND: Scene = {
     canopy: ENKIANTHUS,
     // Sun through the rippled water: a net of light on the stone, glints on the surface.
     caustics: POND_CAUSTICS,
+    clouds: null,
   },
 };
 
@@ -215,6 +227,46 @@ export const WHALES: Scene = {
   floorShadow: null,
   canopy: null,
   caustics: null,
+  clouds: null,
 };
 
-export const SCENES: Scene[] = [KOI_POND, OCEAN, WHALES];
+// A white dragon over a sea of cloud by day, the land far below hazed blue through the gaps. Its
+// body rises and dips in a wave that stays put as it flies, so the body threads in and out of the
+// cloud tops at the same places, the way a sea serpent rides through waves, and wherever it flies
+// above them its shadow falls on the clouds. A click parts the clouds.
+export const DRAGON: Scene = {
+  name: "dragon",
+  // Long: at 2.2 the legs and body together read as a lizard.
+  sharks: [{ kind: "dragon", size: 3, depth: 1 }],
+  species: [],
+  background: "#6b97c9",
+  grid: "rgba(255,255,255,0.07)",
+  wake: [255, 255, 255],
+  // Mist: the colour the body fades into where it skims the cloud tops.
+  fog: [234, 241, 250],
+  fogStrength: 1,
+  // Sky and the sunlit cloud sea below fill the dragon's shaded flanks: it is a white dragon, and
+  // at 0.4 it went grey. Its volume is carried by the ink and the modelled head, not by darkness.
+  ambient: 0.6,
+  fish: [255, 255, 255],
+  // Glints on the scales; the jade belongs to the mane alone.
+  accents: ["#ffffff", "#fff4d6", "#d8f3ff"],
+  light: [-0.6, -0.8],
+  schoolDensity: 0,
+  diet: "fish",
+  click: "scatter",
+  rain: 0,
+  water: "cloud",
+  shore: false,
+  // High wind carries the cloud sea slowly past.
+  wind: 16,
+  food: [214, 150, 84],
+  hunt: "chase",
+  clearCenter: false,
+  floorShadow: null,
+  canopy: null,
+  caustics: null,
+  clouds: SUNLIT_CLOUDS,
+};
+
+export const SCENES: Scene[] = [KOI_POND, OCEAN, WHALES, DRAGON];

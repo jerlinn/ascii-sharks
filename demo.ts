@@ -28,8 +28,8 @@ const engine = new OceanEngine(canvas, cast(SCENES[current]), exporting ? { maxD
 if (streams) exposeStory(engine, canvas, streams);
 // ?wind=off opens with the water still.
 engine.setWind(params.get("wind") !== "off", true);
-// ?shade=off opens with the canopy's shade gone.
-engine.setShade(params.get("shade") !== "off", true);
+// The canopy's shade is off unless ?shade=on: the pond opens in full sun.
+engine.setShade(params.get("shade") === "on", true);
 // ?theme=light|dark, else the system's; it only shows on scenes that have a daylight palette.
 let theme: Theme =
   params.get("theme") === "light" || params.get("theme") === "dark"
@@ -87,10 +87,17 @@ function markCurrent() {
   shadeButton.hidden = !themed(SCENES[current], theme).canopy;
   shadeButton.setAttribute("aria-pressed", String(engine.shade));
   themeButton.setAttribute("aria-pressed", String(theme === "light"));
-  // The page behind the canvas matches the water, so fades between scenes don't flash.
+  // The page behind the canvas matches the water, so fades between scenes don't flash, and the
+  // switchers turn dark on pale water, whether a theme made it pale or the scene is set by day.
   const shown = themed(SCENES[current], theme);
   document.body.style.backgroundColor = shown.background;
-  document.body.classList.toggle("light", shown !== SCENES[current]);
+  document.body.classList.toggle("light", luminance(shown.background) > 0.4);
+}
+
+/** Relative luminance of a "#rrggbb" colour, 0–1. */
+function luminance(hex: string) {
+  const [r, g, b] = [1, 3, 5].map((i) => (parseInt(hex.slice(i, i + 2), 16) / 255) ** 2.2);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
 function toggleTheme() {
@@ -113,8 +120,8 @@ function toggleTheme() {
 
 function toggleShade() {
   engine.setShade(!engine.shade);
-  if (engine.shade) params.delete("shade");
-  else params.set("shade", "off");
+  if (engine.shade) params.set("shade", "on");
+  else params.delete("shade");
   history.replaceState(null, "", `?${params}`);
   markCurrent();
 }
