@@ -7,12 +7,34 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@600&display=swap" rel="stylesheet" />
     <style>
-      html, body { margin: 0; height: 100%; background: #000; }
-      canvas { display: block; width: 100vw; height: 100vh; font-family: "Geist Mono", ui-monospace, Menlo, monospace; }
+      html, body { margin: 0; height: 100%; background: #000; transition: background-color 260ms ease; }
+      canvas { display: block; width: 100vw; height: 100vh; font-family: "Geist Mono", ui-monospace, Menlo, monospace; transition: opacity 260ms ease; }
+      .scenes, .controls { position: fixed; bottom: 16px; display: flex; gap: 6px; font: 600 12px "Geist Mono", ui-monospace, Menlo, monospace; }
+      .scenes { left: 16px; }
+      /* Icons are small targets: wide gaps keep a tap from landing on the neighbour. */
+      .controls { right: 16px; gap: 16px; }
+      .scenes button, .controls button { all: unset; cursor: pointer; padding: 6px 10px; line-height: 16px; color: rgba(255,255,255,0.45); background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.1); }
+      /* Icon-only switches: square, the glyph at the scene labels' line height so both corners sit level. */
+      .controls button { display: grid; padding: 6px; }
+      .controls button svg { width: 16px; height: 16px; }
+      .scenes button span, .controls button span { margin-right: 6px; color: rgba(255,255,255,0.25); }
+      .scenes button:hover, .controls button:hover { color: rgba(255,255,255,0.85); }
+      .scenes button[aria-pressed="true"], .controls button[aria-pressed="true"] { color: #fff; border-color: rgba(255,255,255,0.4); }
+      .scenes button:focus-visible, .controls button:focus-visible { outline: 1px solid #6be0ff; outline-offset: 2px; }
+      .controls button[hidden] { display: none; }
+      body.export .scenes, body.export .controls { visibility: hidden; }
+      /* Too narrow for both bars on one line: the switches sit a row above the scenes. */
+      @media (max-width: 560px) { .controls { bottom: 52px; left: 16px; right: auto; } }
+      body.light .scenes button, body.light .controls button { color: rgba(20,40,30,0.55); background: rgba(255,255,255,0.7); border-color: rgba(20,40,30,0.12); }
+      body.light .scenes button span, body.light .controls button span { color: rgba(20,40,30,0.3); }
+      body.light .scenes button:hover, body.light .controls button:hover { color: rgba(20,40,30,0.9); }
+      body.light .scenes button[aria-pressed="true"], body.light .controls button[aria-pressed="true"] { color: #10201a; border-color: rgba(20,40,30,0.45); }
     </style>
   </head>
   <body>
     <canvas aria-hidden="true"></canvas>
+    <nav class="scenes" aria-label="Scene"></nav>
+    <div class="controls"></div>
     <script type="module" src="/demo.ts"></script>
   </body>
 </html>

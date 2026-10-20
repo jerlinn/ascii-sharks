@@ -6,24 +6,68 @@
  *   4. sharks rasterised cell-by-cell with supersampled edges: grey blocks
  *      shaded by the light, dense glyphs, and shimmering accent colours
  */
-import { clamp, hash3, smoothstep } from "./math";
-import { SHARK_NODES, type Shark, type SharkKind, type World } from "./world";
+import { CanopyField } from "./canopy";
+import { CausticsField } from "./caustics";
+import { clamp, hash3, smoothstep, valueNoise, windAt } from "./math";
+import { RippleField } from "./ripple";
+import type { RGB, Scene } from "./scene";
+import { BUBBLE_LIFE, BUBBLE_RISE, SHARK_NODES, type Shark, type SharkKind, type World } from "./world";
 
 const ALPHA_LEVELS = 6;
 const FISH_ALPHAS = [0.28, 0.42, 0.58, 0.74, 0.9];
+const BUBBLE_ALPHAS = [0.15, 0.3, 0.5, 0.7, 0.9];
+/** Floor-shadow strength steps, each one fillStyle. */
+const FLOOR_LEVELS = [0.25, 0.5, 0.75, 1];
 
-// Dot colour classes: blue, green, red, pale; the last entry is the cyan wake.
-const DOT_RGB: [number, number, number][] = [
+// Depth through water: deeper creatures fade toward the scene's fog colour and their glyphs
+// lose contrast, up to FOG_MAX; a creature swimming above casts SHADOW on those beneath.
+const FOG_RATE = 1.3;
+const FOG_MAX = 0.6;
+const SHADOW = 0.45;
+/** How far a creature's shadow falls from it, as a fraction of its length, away from the light. */
+const SHADOW_DROP = 0.08;
+/**
+ * Shadows on a visible pond floor: how far they fall from the body (fractions of L) for a
+ * creature lying deepest (depth 0, near the floor) and nearest the surface (depth 1), and how
+ * dark they are. The nearer the surface, the further off and fainter the shadow.
+ */
+const FLOOR_DROP_DEEP = 0.05;
+const FLOOR_DROP_SHALLOW = 0.16;
+const FLOOR_ALPHA = 0.15;
+/**
+ * Caustics in glyphs: beads of light along the net, with no way to them. Line glyphs laid along
+ * it (`- \\ | /`) made every line ruler-straight; light lines swell and thin and bend. Above
+ * CAUSTIC_SHOW of light beyond its share a cell shows; the bead fills out (`. : o`) and its ink
+ * strengthens, in CAUSTIC_INKS steps, as the light grows toward CAUSTIC_FULL.
+ */
+// Under a full gust the light runs heavy-tailed: a tenth of the cells over 0.9 beyond their
+// share, a twentieth over 1.6, one in a hundred over 4.2. About the brightest sixth show, the
+// net's lines; beads and ink follow the light's logarithm, as the eye does.
+const CAUSTIC_SHOW = 0.55;
+const CAUSTIC_FULL = 5;
+/**
+ * A food pellet: a large solid dot, so it reads as a thing in the water, not a point of light
+ * like a glint's `+` and `*`.
+ */
+const FOOD_GLYPH = "●";
+/** A glint this strong or more is at its height: `*`, below it `+`. */
+const GLINT_PEAK = 0.7;
+/** The part of the gust field's range over which the chop, and its net of light, comes up. */
+const CHOP_GUST: [number, number] = [0.3, 0.65];
+const CAUSTIC_GLYPHS = ".:o";
+const CAUSTIC_INKS = 8;
+/** How much of the gust field's range shakes a canopy's branches. */
+const CANOPY_GUST: [number, number] = [0.35, 0.8];
+
+// Dot colour classes: blue, green, red, pale. The wake class after them takes the scene's colour.
+const DOT_RGB: RGB[] = [
   [48, 52, 235],
   [52, 205, 60],
   [228, 50, 44],
   [190, 212, 255],
-  [110, 230, 255],
 ];
 const DOT_BASE_ALPHA = [1, 1, 1, 1, 1];
-const WAKE = DOT_RGB.length - 1;
-
-const ACCENTS = ["#e0892c", "#e03a32", "#b44ae0", "#33c8cc", "#3cb54a", "#3150e8", "#d9c14a"];
+const WAKE = DOT_RGB.length;
 
 // Sparse glyphs on bright skin, dense glyphs in shadow, so the texture
 // reinforces the shading instead of fighting it.
@@ -42,6 +86,69 @@ const FLAG_EYE = 5;
 /** Dark skin markings: tiger bars, zebra-shark spots. */
 const FLAG_MARK = 6;
 const MARK_GLYPHS = "#%@";
+/** Koi red (hi) patches: lit skin in their own colour instead of the species tint. */
+const FLAG_HI = 7;
+const HI_TINT: RGB = [1.55, 0.5, 0.24];
+/** Pale skin in the shape's own `pectoralTint`: humpback flippers, and throat pleats on a lunge. */
+const FLAG_PALE = 8;
+const KOI_VARIETIES = 4;
+
+// Ripple water (simulated in ripple.ts): the crest height that starts to show, and how fast
+// crests brighten above it.
+const RIPPLE_SHOW = 0.08;
+const RIPPLE_GAIN = 14;
+/**
+ * How hard a tail stroke pushes the surface, per frame at the peak of the beat, rising with
+ * speed: STROKE · (1 + speed / STROKE_SPEED). Tuned by how many cells a wake lights
+ * (tools/ripple-scale.ts): a gliding koi ~50, rushing ~160, against ~18 for one pellet, ~76
+ * for a handful and ~145 for a raindrop.
+ */
+const RIPPLE_STROKE = 0.022;
+const STROKE_SPEED = 150;
+/** Amplitude of a raindrop's ringing; other drops scale it by their event strength. */
+const DROP_AMP = 0.18;
+/** A koi gulping food makes a small slurp of a ring. */
+const GULP_AMP = 0.1;
+/**
+ * Cat's paws: gusts roughen the water in patches that sweep downwind. A gust field (value
+ * noise GUST_PX across) travels at GUST_SPEED times the surface drift; where it is above
+ * GUST_FLOOR, each frame lands a few tiny pokes, so wind reads as shifting rough patches on
+ * otherwise glassy water, the way it does on a real pond. Tuned to light about 275 cells on
+ * average across a 1280×800 pond: below ~70 the gusts vanish, above ~1000 they cover it.
+ */
+const GUST_PX = 240;
+const GUST_SPEED = 2.5;
+const GUST_FLOOR = 0.6;
+const GUST_POKES = 60;
+const GUST_AMP = 0.11;
+// A drop doesn't just dent the water: it craters and rebounds a few times, so the impact
+// point rings at DROP_HZ for three cycles and sends out a train of rings almost at once.
+const DROP_HZ = 4;
+const DROP_DECAY = 0.3;
+
+/** Sparse glyphs and skin-coloured ink, so glossy skin (koi) reads smooth rather than grainy. */
+const GLOSSY_RAMP = "':;+=*";
+const GLOSSY_INK = 0.62;
+/**
+ * Koi fins are white membranes, thick and nearly opaque at the root and thinning to nothing at
+ * the edge. Expressed in the two channels the rest of the picture uses: the block is a cool
+ * white that lets through more of the water or floor behind it the thinner the fin gets
+ * (GLOSSY_FIN_SEE at the root, GLOSSY_FIN_SEE_EDGE at the rim), and the glyphs thin out the
+ * same way, so the fin dissolves into the water instead of ending in a hard outline. The cool
+ * tint sets it apart from a warm floor by hue where brightness can't. Lit about as brightly as
+ * the skin; a shark fin's 40 + 120 left koi fins grey on any water.
+ */
+const GLOSSY_FIN_LEVEL = 205;
+const GLOSSY_FIN_SEE = 0.1;
+const GLOSSY_FIN_SEE_EDGE = 0.65;
+const GLOSSY_FIN_TINT: RGB = [1.18, 1.23, 1.28];
+/** Fin glyphs by thickness, from the rim (none) to the root. */
+const GLOSSY_FIN_RAMP = " .':;";
+/** The level the floor's fill light lifts unlit skin toward, scaled by the palette's ambient. */
+const FILL_LEVEL = 215;
+
+/** Pectoral anhedral in radians; `pectoral[3]` is the reach seen from above at this droop. */
+const PECTORAL_DROOP = 0.35;
 
 // Sub-cell sample offsets for anti-aliased silhouettes.
 const SUBSAMPLES = [0.25, 0.3, 0.75, 0.3, 0.25, 0.72, 0.75, 0.72];
@@ -62,10 +169,38 @@ interface SharkShape {
   pectoral: [number, number, number, number];
   /** Notched (falcate) trailing edge on the pectorals. */
   falcate: boolean;
+  /**
+   * Fan-shaped pectorals and pelvics, broad at the outer edge. The fin then pivots on the
+   * spine at the first value and the other two mark its leading and trailing outer corners.
+   */
+  fanFins?: boolean;
   /** Pelvic fins: leading root, trailing root, tip, reach. */
   pelvic: [number, number, number, number];
   /** Forked caudal fin reach, or 0 when the tail is a ribbon (zebra shark). */
   caudal: number;
+  /** Fan tail instead of a fork: where along the body it starts flaring out to `caudal`. */
+  caudalFan?: number;
+  /** Smooth skin: sparse glyphs inked in a darker shade of the skin. */
+  glossy?: boolean;
+  /**
+   * How the pectoral and pelvic fins move and curve. They flap through `flap[0]` radians at
+   * `flap[1]` times the tail-beat rate, with the tip trailing the root by up to `lag` more, so
+   * a flapping fin bends like a paddle instead of swinging like a stick, and they arch back by
+   * `arch` radians from root to tip even at rest. Sharks barely flutter; koi scull all the
+   * time; a humpback sweeps its long, arched flippers slowly. A fin does not bend with the
+   * trunk behind its root: tried, that folded the outer fin of a turn onto the flank.
+   */
+  finMotion?: { flap: [number, number]; lag: number; arch: number };
+  /** Body wave: amplitude (fraction of L), how sharply it grows toward the tail, and wavenumber. */
+  wave?: [number, number, number];
+  /** Colour of pale skin: the white leading edge of a humpback's flippers and its throat pleats. */
+  pectoralTint?: RGB;
+  /**
+   * Pectorals as long blades of nearly even width with a rounded tip (humpback flippers)
+   * instead of triangles. The blade runs from the middle of the root to the tip; its chord
+   * is the root's length.
+   */
+  flipper?: boolean;
   dorsal: [number, number];
   secondDorsal: [number, number];
   /**
@@ -231,9 +366,76 @@ const SHAPES: Record<SharkKind, SharkShape> = {
     gills: [0.14, 0.22],
     tint: [1.1, 0.96, 0.76],
   },
+  // Koi: a round blunt head, a deep back that tapers to a slim peduncle, short rounded fins,
+  // one long dorsal and a broad tail. White base; the red and black come from marking().
+  koi: {
+    halfWidth: (s) => {
+      if (s < 0.12) return 0.085 * Math.pow(Math.sin(((s / 0.12) * Math.PI) / 2), 0.55);
+      if (s < 0.32) return 0.085 + 0.03 * smoothstep(0.12, 0.32, s);
+      if (s < 0.8) return 0.03 + 0.085 * Math.pow(1 - (s - 0.32) / 0.48, 1.1);
+      const k = (s - 0.8) / 0.2;
+      return 0.03 * (1 - k) + 0.012 * Math.sin(k * Math.PI);
+    },
+    // Reach is measured from the spine, so a fin only shows where it clears the half-width
+    // (about 0.1 at the pectorals, 0.08 at the pelvics). Fans keep the part outside broad.
+    pectoral: [0.18, 0.22, 0.3, 0.17],
+    falcate: false,
+    fanFins: true,
+    pelvic: [0.48, 0.51, 0.58, 0.13],
+    // A broad fan that flares to the end, with a shallow fork.
+    caudal: 0.14,
+    caudalFan: 0.8,
+    glossy: true,
+    // Supple and loose: a bigger swing that reaches further up the body, in a tighter S.
+    wave: [0.065, 1.3, 6.3],
+    finMotion: { flap: [0.22, 1.4], lag: 0.3, arch: 0.15 },
+    dorsal: [0.36, 0.6],
+    secondDorsal: [0, 0],
+    eye: [0.06, 0.09],
+    gills: [0, 0],
+    tint: [1.4, 1.37, 1.28],
+  },
+  // Humpback from above: a flat, broad head studded with tubercles, a long taper to a slim
+  // tail stock, a small dorsal hump far back, wide flukes, and the wing-long white flippers
+  // a third of the body long. No pelvic fins. Charcoal back.
+  humpback: {
+    halfWidth: (s) => {
+      if (s < 0.16) return 0.075 * Math.pow(Math.sin(((s / 0.16) * Math.PI) / 2), 0.6);
+      if (s < 0.32) return 0.075 + 0.03 * smoothstep(0.16, 0.32, s);
+      if (s < 0.86) return 0.018 + 0.087 * Math.pow(1 - (s - 0.32) / 0.54, 1.2);
+      return 0.018 * (1 - (s - 0.86) / 0.14);
+    },
+    // Blade flippers a third of the body long, about an eighth as wide.
+    pectoral: [0.24, 0.32, 0.56, 0.36],
+    falcate: false,
+    flipper: true,
+    finMotion: { flap: [0.1, 0.35], lag: 0.14, arch: 0.22 },
+    pectoralTint: [1.3, 1.33, 1.36],
+    pelvic: [0, 0, 0, 0],
+    caudal: 0.17,
+    caudalFan: 0.86,
+    dorsal: [0.63, 0.67],
+    secondDorsal: [0, 0],
+    eye: [0.19, 0.21],
+    gills: [0, 0],
+    tint: [0.66, 0.72, 0.8],
+  },
 };
 
 const KINDS = Object.keys(SHAPES) as SharkKind[];
+/**
+ * Sharks' pectorals are stiff: they don't flap, they only curve a little.
+ * Only the tip of a long swept-back triangle shows past the flank, so even a few degrees of
+ * flap swings much of it under the body and the fin seems to shrink.
+ */
+const DEFAULT_FIN_MOTION = { flap: [0.015, 0.5] as [number, number], lag: 0.015, arch: 0.12 };
+
+/** "#rgb" or "#rrggbb" to [r, g, b]. */
+function hexRGB(hex: string): RGB {
+  const h = hex.replace("#", "");
+  const full = h.length === 3 ? [...h].map((c) => c + c).join("") : h;
+  return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16)) as RGB;
+}
 
 function inTriangle(
   px: number, py: number,
@@ -248,9 +450,12 @@ function inTriangle(
 }
 
 /** Visible dark-grey cell grid, snapped to device pixels. Shared with the sidebar backdrop. */
-export function paintGrid(g: CanvasRenderingContext2D, W: number, H: number, cw: number, ch: number, dpr: number) {
+export function paintGrid(
+  g: CanvasRenderingContext2D, W: number, H: number, cw: number, ch: number, dpr: number,
+  stroke = "rgba(255,255,255,0.055)",
+) {
   g.setTransform(1, 0, 0, 1, 0, 0);
-  g.strokeStyle = "rgba(255,255,255,0.055)";
+  g.strokeStyle = stroke;
   g.lineWidth = 1;
   g.beginPath();
   for (let c = 0; c <= Math.ceil(W / cw); c++) {
@@ -286,8 +491,14 @@ export class AsciiRenderer {
   private heat = new Float32Array(0);
   private bucketOf = new Uint8Array(0);
   private bucketOrder = new Int32Array(0);
-  private bucketCounts = new Int32Array(DOT_RGB.length * ALPHA_LEVELS + 1);
+  private bucketCounts = new Int32Array((WAKE + 1) * ALPHA_LEVELS + 1);
   private dotStyles: string[] = [];
+
+  /** The scene the colours below were built for; render() rebuilds them when the world's changes. */
+  private scene: Scene | null = null;
+  private accents: string[] = [];
+  private lightX = 0;
+  private lightY = 0;
 
   private sharkFlag = new Uint8Array(0);
   private sharkShade = new Float32Array(0);
@@ -295,7 +506,19 @@ export class AsciiRenderer {
   private sharkDepth = new Float32Array(0);
   private sharkKind = new Uint8Array(0);
   /** Cells darkened by a shark's shadow on the seabed. */
-  private sharkShadow = new Uint8Array(0);
+  /** Depth of the nearest creature shading each cell: its shadow, or its edge over a deeper body. */
+  private sharkShadow = new Float32Array(0);
+  /** Shadow cast on the pond floor in each cell, 0–1, where the scene's floor shows. */
+  private floorShade = new Float32Array(0);
+  private floorStyles: string[] = [];
+  /** Sunlight through the scene's canopy, if it has one. */
+  private canopy = new CanopyField();
+  /** How much of the canopy's shade falls this frame, as the world eases it in or out. */
+  private shadeAmount = 0;
+  /** Sun bent and mirrored by the ripples, on a sunny scene, and its ink by glyph. */
+  private caustics = new CausticsField();
+  private causticStyles: string[] = [];
+  private glintStyle = "";
   private spine = new Float32Array(SHARK_NODES * 2);
   private arc = new Float32Array(SHARK_NODES);
   private arcTotal = 1;
@@ -303,6 +526,21 @@ export class AsciiRenderer {
   private sharkId = 0;
   private finTipLeft = 0;
   private finTipRight = 0;
+  /**
+   * Straight frames pinned to the spine at the pectoral and pelvic roots: a point and the
+   * tailward tangent there. Fins are tested in these, not in body coordinates.
+   */
+  private pecFrame = { x: 0, y: 0, tx: 1, ty: 0 };
+  private pelFrame = { x: 0, y: 0, tx: 1, ty: 0 };
+  /** The fins' pose this frame: a sweep (flap) about the root. */
+  private finSweep = 0;
+  /** Extra sweep at the fin tip: its lag behind the flap plus its resting arch. */
+  private finTipSweep = 0;
+  private finPose = { u: 0, a: 0 };
+  /** The current shark's gape, 0 shut → 1 wide. */
+  private gape = 0;
+  /** Where the dorsal midline sits across the body (−1…1, signed like v) once the shark rolls. */
+  private rollX = 0;
   // Scratch outputs of sampleShark(), to avoid allocating per sample.
   private hitFlag = 0;
   private hitShade = 0;
@@ -315,21 +553,72 @@ export class AsciiRenderer {
   private frameId = 0;
   /** Fish cells bucketed by brightness, so each bucket is one fillStyle. */
   private fishBuckets: number[][] = FISH_ALPHAS.map(() => []);
-  private fishStyles = FISH_ALPHAS.map((a) => `rgba(230,238,255,${a})`);
+  private fishStyles: string[] = [];
+  /** Ripple water's own square-grid surface; `energy` is sampled from it on ripple scenes. */
+  private ripple = new RippleField();
+  private wind = { x: 0, y: 0 };
+  /** How far the gust field has drifted downwind, px. */
+  private gustDrift = { x: 0, y: 0 };
+  /** Impacts still ringing on ripple water; r in px, and a negative age until they land. */
+  private drops: { x: number; y: number; age: number; amp: number; r: number }[] = [];
+  private bubbleStyles: string[] = [];
+  private fogRGB: RGB = [0, 0, 0];
+  private fogStrength = 1;
+  private ambient = 0;
+  /** The water (or floor) colour behind everything, for what shows through translucent fins. */
+  private waterRGB: RGB = [0, 0, 0];
+  /** Pellet cells this frame, drawn in the scene's food colour. */
+  private foodCells: number[] = [];
+  private foodStyle = "";
 
   constructor(private canvas: HTMLCanvasElement) {
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) throw new Error("2D canvas unavailable");
     this.ctx = ctx;
     this.bg = document.createElement("canvas");
+  }
 
-    for (let c = 0; c < DOT_RGB.length; c++) {
-      const [r, g, b] = DOT_RGB[c];
+  private applyScene(scene: Scene) {
+    // A theme only recolours: keep the water moving. A new scene starts its water still.
+    const recast = this.scene?.name !== scene.name;
+    this.scene = scene;
+    const shade = scene.floorShadow;
+    this.floorStyles = shade ? FLOOR_LEVELS.map((a) => `rgba(${shade.join(",")},${(a * FLOOR_ALPHA).toFixed(3)})`) : [];
+    // Leaf shade takes the floor-shadow colour: the same scattered light fills both in.
+    this.canopy.set(scene.canopy, scene.light, shade ?? [0, 0, 0]);
+    this.caustics.set(scene.caustics, scene.light);
+    const ink = scene.caustics?.ink;
+    this.causticStyles = ink ? Array.from({ length: CAUSTIC_INKS }, (_, k) => `rgba(${ink.join(",")},${(0.35 + (0.6 * k) / (CAUSTIC_INKS - 1)).toFixed(2)})`) : [];
+    this.glintStyle = scene.caustics ? `rgb(${scene.caustics.glintInk.join(",")})` : "";
+    this.dotStyles = [];
+    for (let c = 0; c <= WAKE; c++) {
+      const [r, g, b] = c === WAKE ? scene.wake : DOT_RGB[c];
       for (let l = 0; l < ALPHA_LEVELS; l++) {
         const a = (DOT_BASE_ALPHA[c] * (l + 1)) / ALPHA_LEVELS;
         this.dotStyles.push(`rgba(${r},${g},${b},${a.toFixed(3)})`);
       }
     }
+    const [wr, wg, wb] = scene.wake;
+    this.bubbleStyles = BUBBLE_ALPHAS.map((a) => `rgba(${wr},${wg},${wb},${a})`);
+    const [fr, fg, fb] = scene.fish;
+    this.fishStyles = FISH_ALPHAS.map((a) => `rgba(${fr},${fg},${fb},${a})`);
+    this.foodStyle = `rgb(${scene.food.join(",")})`;
+    this.accents = scene.accents;
+    this.fogRGB = scene.fog;
+    this.fogStrength = scene.fogStrength;
+    this.ambient = scene.ambient;
+    this.waterRGB = hexRGB(scene.background);
+    [this.lightX, this.lightY] = scene.light;
+    this.ripple.setOpen(!scene.shore);
+    if (recast) {
+      // A glowing wake and a wave field don't mean the same thing; start the new water still.
+      this.energy.fill(0);
+      this.energyTmp.fill(0);
+      this.heat.fill(0);
+      this.drops.length = 0;
+      this.ripple.clear();
+    }
+    this.paintBackground();
   }
 
   get cellWidth() {
@@ -372,8 +661,12 @@ export class AsciiRenderer {
     this.sharkKey = new Uint32Array(n);
     this.sharkDepth = new Float32Array(n);
     this.sharkKind = new Uint8Array(n);
-    this.sharkShadow = new Uint8Array(n);
+    this.sharkShadow = new Float32Array(n);
+    this.floorShade = new Float32Array(n);
     this.fishStamp = new Uint32Array(n);
+    this.ripple.resize(width, height, this.cw);
+    this.canopy.resize(this.cols, this.rows, this.cw, this.ch, width, height);
+    this.caustics.resize(this.cols, this.rows, this.cw, this.ch, width, height);
 
     for (let i = 0; i < n; i++) {
       const col = i % this.cols;
@@ -388,28 +681,47 @@ export class AsciiRenderer {
 
   private paintBackground() {
     const g = this.bg.getContext("2d");
-    if (!g) return;
+    const { scene } = this;
+    if (!g || !scene) return;
     const { width: W, height: H, dpr, cw, ch } = this;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.fillStyle = "#000";
+    g.fillStyle = scene.background;
     g.fillRect(0, 0, W, H);
-    paintGrid(g, W, H, cw, ch, dpr);
+    paintGrid(g, W, H, cw, ch, dpr, scene.grid);
   }
 
   render(world: World, dt: number) {
     const { ctx, dpr, cols, ch } = this;
     if (cols === 0) return;
+    if (world.scene !== this.scene) this.applyScene(world.scene);
     const t = world.time;
+    windAt(t, world.windSpeed, this.wind);
+    // The gust field rides on the wind; carried step by step, so it slows when the wind eases
+    // instead of leaping (wind × t would sweep it across the pond as the wind changed).
+    this.gustDrift.x += this.wind.x * GUST_SPEED * dt;
+    this.gustDrift.y += this.wind.y * GUST_SPEED * dt;
+    this.shadeAmount = this.canopy.active ? world.shade : 0;
+    if (this.shadeAmount > 0.001) {
+      const [lo, hi] = CANOPY_GUST;
+      const wind = world.windSpeed / Math.max(1, world.scene.wind);
+      this.canopy.update(t, wind, (x, y) => smoothstep(lo, hi, this.gust(x, y)));
+    }
 
     this.consumeEvents(world);
     this.rasterizeSharks(world.sharks, t);
-    this.depositWake(world);
+    this.depositWake(world, dt);
     this.diffuse(dt);
+    if (this.caustics.active) {
+      const breeze = world.windSpeed / Math.max(1, world.scene.wind);
+      const [lo, hi] = CHOP_GUST;
+      this.caustics.update(this.ripple, t, breeze, (x, y) => smoothstep(lo, hi, this.gust(x, y)), (i) => this.sunAt(i));
+    }
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.drawImage(this.bg, 0, 0);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+    this.drawFloorShadows();
     this.markFish(world);
     this.drawDots(t);
 
@@ -417,9 +729,13 @@ export class AsciiRenderer {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
+    this.drawCaustics();
     this.drawHeat();
     this.drawFish();
     this.drawSharks(t);
+    this.drawBubbles(world);
+    this.drawShade();
+    this.drawGlints();
   }
 
   // ── simulation → field ──────────────────────────────────────────────
@@ -446,10 +762,19 @@ export class AsciiRenderer {
   }
 
   private consumeEvents(world: World) {
+    const ripple = world.scene.water === "ripple";
     for (const e of world.events) {
       if (e.kind === "eat") {
-        this.stamp(this.heat, e.x, e.y, 2, 1);
-        this.stamp(this.energy, e.x, e.y, 3, 0.9);
+        // Embers only where something was killed, not where a pellet was taken.
+        if (world.scene.diet === "fish") this.stamp(this.heat, e.x, e.y, 2, 1);
+        if (ripple) this.drops.push({ x: e.x, y: e.y, age: 0, amp: GULP_AMP, r: 12 });
+        else this.stamp(this.energy, e.x, e.y, 3, 0.9);
+      } else if (e.kind === "drop") {
+        if (ripple) this.drops.push({ x: e.x, y: e.y, age: -(e.delay ?? 0), amp: DROP_AMP * (e.strength ?? 1), r: 12 });
+        else this.stamp(this.energy, e.x, e.y, 2, 1);
+      } else if (ripple) {
+        // A whale breaching or a hard slap: a wide impact that rings like a big drop.
+        this.drops.push({ x: e.x, y: e.y, age: -(e.delay ?? 0), amp: 0.9 * (e.strength ?? 1), r: 36 });
       } else {
         this.stamp(this.energy, e.x, e.y, 6, 1.4);
       }
@@ -457,7 +782,11 @@ export class AsciiRenderer {
     world.events.length = 0;
   }
 
-  private depositWake(world: World) {
+  private depositWake(world: World, dt: number) {
+    if (world.scene.water === "ripple") {
+      this.stirRipples(world, dt);
+      return;
+    }
     const { energy } = this;
     for (const f of world.fish) {
       if (!f.alive) continue;
@@ -476,22 +805,82 @@ export class AsciiRenderer {
     }
   }
 
-  /** Blur + decay so wakes spread out like ripples and fade. */
-  private diffuse(dt: number) {
-    const { cols, rows, energy, energyTmp: tmp, heat } = this;
-    const decay = Math.exp(-dt * 1.5);
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const i = r * cols + c;
-        const l = c > 0 ? energy[i - 1] : energy[i];
-        const rt = c < cols - 1 ? energy[i + 1] : energy[i];
-        const u = r > 0 ? energy[i - cols] : energy[i];
-        const d = r < rows - 1 ? energy[i + cols] : energy[i];
-        tmp[i] = (energy[i] * 4 + l + rt + u + d) * 0.125 * decay;
+  /**
+   * A steady deposit would pile ripple water into humps, so here swimmers push the surface
+   * back and forth with their tail beat instead: each stroke sends out a ring and the
+   * pushes cancel over a beat. Only the big creatures stir the surface; small fish swim
+   * too deep and too light to ring it. A resting fingertip trembles and rings the same way.
+   */
+  private stirRipples(world: World, dt: number) {
+    const { ripple, drops } = this;
+    for (let k = drops.length - 1; k >= 0; k--) {
+      const d = drops[k];
+      if (d.age > 3 / DROP_HZ) {
+        drops.splice(k, 1);
+        continue;
       }
+      if (d.age >= 0) {
+        ripple.stamp(d.x, d.y, d.r, d.amp * Math.sin(2 * Math.PI * DROP_HZ * d.age) * Math.exp(-d.age / DROP_DECAY));
+      }
+      d.age += dt;
     }
-    this.energy = tmp;
-    this.energyTmp = energy;
+    for (const sh of world.sharks) {
+      const k = SHARK_NODES - 1;
+      const stroke = RIPPLE_STROKE * (1 + sh.speed / STROKE_SPEED);
+      ripple.stamp(sh.nodes[k * 2], sh.nodes[k * 2 + 1], 8, stroke * Math.sin(sh.phase));
+    }
+    if (world.pointer.active) {
+      ripple.stamp(world.pointer.x, world.pointer.y, 12, 0.05 * Math.sin(world.time * 9));
+    }
+    this.roughen(world);
+  }
+
+  /** Cat's paws: tiny pokes where the gust field, drifting downwind, is strong. */
+  private roughen(world: World) {
+    const speed = world.windSpeed;
+    if (speed <= 0) return;
+    const { width: W, height: H, wind } = this;
+    const strength = speed / Math.max(1, world.scene.wind);
+    const pokes = Math.round(GUST_POKES * strength * ((W * H) / (1280 * 800)));
+    for (let k = 0; k < pokes; k++) {
+      const x = Math.random() * W;
+      const y = Math.random() * H;
+      const g = this.gust(x, y);
+      if (g < GUST_FLOOR) continue;
+      const amp = GUST_AMP * strength * ((g - GUST_FLOOR) / (1 - GUST_FLOOR));
+      this.ripple.stamp(x, y, 6, Math.random() < 0.5 ? amp : -amp);
+    }
+  }
+
+  /** The gust field at a point, 0–1, drifting downwind: it roughens the water and shakes the trees. */
+  private gust(x: number, y: number) {
+    const { gustDrift } = this;
+    return valueNoise((x - gustDrift.x) / GUST_PX, (y - gustDrift.y) / GUST_PX, 91);
+  }
+
+  /** Blur + decay so wakes spread out and fade, or, on ripple water, propagate as waves. */
+  private diffuse(dt: number) {
+    const { cols, rows, energy, energyTmp: tmp, heat, cw, ch } = this;
+    if (this.scene?.water === "ripple") {
+      this.ripple.step(dt, this.wind.x, this.wind.y);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) energy[r * cols + c] = this.ripple.sample(c * cw + cw / 2, r * ch + ch / 2);
+      }
+    } else {
+      const decay = Math.exp(-dt * 1.5);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          const l = c > 0 ? energy[i - 1] : energy[i];
+          const rt = c < cols - 1 ? energy[i + 1] : energy[i];
+          const u = r > 0 ? energy[i - cols] : energy[i];
+          const d = r < rows - 1 ? energy[i + cols] : energy[i];
+          tmp[i] = (energy[i] * 4 + l + rt + u + d) * 0.125 * decay;
+        }
+      }
+      this.energy = tmp;
+      this.energyTmp = energy;
+    }
     const heatDecay = Math.exp(-dt * 2.2);
     for (let i = 0; i < heat.length; i++) heat[i] *= heatDecay;
   }
@@ -535,7 +924,9 @@ export class AsciiRenderer {
     const s = bestS;
     const u = s * L;
     const shape = this.shape;
-    const w = shape.halfWidth(s) * L;
+    // A lunging whale's throat balloons out behind the open jaw.
+    const swell = this.gape > 0 ? 1 + this.gape * 0.8 * (1 - smoothstep(0.05, 0.42, s)) : 1;
+    const w = shape.halfWidth(s) * L * swell;
     this.hitDist = a;
     this.hitS = s;
     this.hitV = a * bestSign;
@@ -559,14 +950,19 @@ export class AsciiRenderer {
     if (a <= w) {
       const across = a / (w || 1);
       // Rounded back lit from the top-left; flanks fall off into shadow.
-      const facing = (bestNx * -0.6 + bestNy * -0.8) * across;
+      const facing = (bestNx * this.lightX + bestNy * this.lightY) * across;
       let shade = 0.58 - across * across * 0.42 + facing * 0.26;
+      // A round body shades the same however it rolls; the roll shows in the markings.
+      // fromBack is the distance from the dorsal midline, which slides with the roll,
+      // and past the old silhouette edge the pale belly comes into view.
+      const fromBack = Math.abs(across * bestSign - this.rollX);
+      shade = Math.min(1, shade * (1 + 0.9 * smoothstep(1, 1.25, fromBack)));
       let flag = FLAG_BODY;
-      if (s > shape.dorsal[0] && s < shape.dorsal[1] && across < 0.3) {
+      if (s > shape.dorsal[0] && s < shape.dorsal[1] && fromBack < 0.3) {
         // First dorsal fin, catching the light.
         flag = FLAG_RIDGE;
         shade = 1;
-      } else if (s > shape.secondDorsal[0] && s < shape.secondDorsal[1] && across < 0.4) {
+      } else if (s > shape.secondDorsal[0] && s < shape.secondDorsal[1] && fromBack < 0.4) {
         shade = Math.max(shade, 0.82);
       } else if (shape.eye && s > shape.eye[0] && s < shape.eye[1] && across > 0.6) {
         flag = FLAG_EYE;
@@ -580,59 +976,210 @@ export class AsciiRenderer {
       } else if (shape === SHAPES.zebra && s > 0.08 && s < 0.55 && (across < 0.1 || Math.abs(across - 0.6) < 0.08)) {
         // Zebra sharks carry pale ridges down the back.
         shade = Math.max(shade, 0.8);
-      } else if (this.marked(s, a * bestSign, L, across)) {
-        flag = FLAG_MARK;
+      } else if (this.gape > 0.3 && s < 0.4 && across > 0.45 && Math.floor(across * 10) % 2 === 0) {
+        // Throat pleats, stretched open and pale.
+        flag = FLAG_PALE;
+      } else {
+        flag = this.marking(s, a * bestSign, L, across) || FLAG_BODY;
       }
       this.hitFlag = flag;
       this.hitShade = shade;
       return true;
     }
 
-    const tip = bestSign > 0 ? this.finTipRight : this.finTipLeft;
+    // Fins are rigid: they turn with the body at the root but don't bend with it. So they're
+    // tested in a straight frame pinned at the root (fu along, fa out), not in body coordinates,
+    // which fan out round a bend: a long fin on the outside of a turn stretched to nearly twice
+    // its length, and squashed on the inside.
     const [p0, p1, p2] = shape.pectoral;
-    if (
-      inTriangle(u, a, L * p0, 0, L * p1, 0, L * p2, tip) &&
-      // Falcate (sickle) fins get a concave trailing edge.
-      !(shape.falcate && inTriangle(u, a, L * p1, 0, L * (p1 + (p2 - p1) * 0.33), tip * 0.55, L * p2, tip))
+    const pf = this.pecFrame;
+    const pdx = px - pf.x;
+    const pdy = py - pf.y;
+    const pcross = pf.tx * pdy - pf.ty * pdx;
+    const tip = pcross >= 0 ? this.finTipRight : this.finTipLeft;
+    const pec = this.poseFin((L * (p0 + p1)) / 2, pdx * pf.tx + pdy * pf.ty, Math.abs(pcross), tip);
+    const fu = pec.u;
+    const fa = pec.a;
+    if (shape.flipper) {
+      const flag = this.inFlipper(fu, fa, L, tip);
+      if (flag) {
+        this.hitFlag = flag;
+        this.hitShade = flag === FLAG_PALE ? 0.5 : 0.38 + 0.22 * (1 - clamp(fa / tip, 0, 1));
+        return true;
+      }
+    } else if (
+      shape.fanFins
+        ? inTriangle(fu, fa, L * p0, 0, L * p1, tip, L * p2, tip * 0.8)
+        : inTriangle(fu, fa, L * p0, 0, L * p1, 0, L * p2, tip) &&
+          // Falcate (sickle) fins get a concave trailing edge.
+          !(shape.falcate && inTriangle(fu, fa, L * p1, 0, L * (p1 + (p2 - p1) * 0.33), tip * 0.55, L * p2, tip))
     ) {
-      this.hitFlag = this.marked(s, a * bestSign, L, 0) ? FLAG_MARK : FLAG_FIN;
-      this.hitShade = 0.38 + 0.22 * (1 - clamp(a / tip, 0, 1));
+      this.hitFlag = shape.pectoralTint
+        ? FLAG_PALE
+        : this.marking(s, a * bestSign, L, 0) === FLAG_MARK ? FLAG_MARK : FLAG_FIN;
+      // White flippers are the brightest thing on a humpback; other fins sit in the body's shade.
+      this.hitShade = (shape.pectoralTint ? 0.62 : 0.38) + (shape.pectoralTint ? 0.3 : 0.22) * (1 - clamp(fa / tip, 0, 1));
+      // A supple fish's fin is thick at the root and thins to nothing at the edge.
+      if (shape.glossy) {
+        const root = shape.halfWidth((p0 + p1) / 2) * L;
+        this.hitShade = 1 - clamp((fa - root) / Math.max(1, tip - root), 0, 1);
+      }
       return true;
     }
     const [v0, v1, v2, vr] = shape.pelvic;
-    if (
-      inTriangle(u, a, L * v0, 0, L * v1, 0, L * v2, L * vr) ||
-      // Forked caudal fin.
-      (shape.caudal > 0 && inTriangle(u, a, L * 0.86, 0, L * 0.95, 0, L, L * shape.caudal))
-    ) {
+    const vf = this.pelFrame;
+    const vdx = px - vf.x;
+    const vdy = py - vf.y;
+    const vcross = vf.tx * vdy - vf.ty * vdx;
+    const pel = this.poseFin((L * (v0 + v1)) / 2, vdx * vf.tx + vdy * vf.ty, Math.abs(vcross), L * vr);
+    const vu = pel.u;
+    const va = pel.a;
+    // A degenerate triangle would contain every point, so no pelvics means vr = 0 and none drawn.
+    const pelvic =
+      vr > 0 &&
+      (shape.fanFins
+        ? inTriangle(vu, va, L * v0, 0, L * v1, L * vr, L * v2, L * vr * 0.8)
+        : inTriangle(vu, va, L * v0, 0, L * v1, 0, L * v2, L * vr));
+    // Forked caudal fin.
+    const caudal = !pelvic && shape.caudal > 0 && this.inCaudal(u, a, L);
+    if (pelvic || caudal) {
       this.hitFlag = FLAG_FIN;
       this.hitShade = 0.36;
+      if (shape.glossy) {
+        // Membrane thickness: from the root out to the edge, and along the tail to its tips.
+        const fan = shape.caudalFan ?? 0.86;
+        const root = shape.halfWidth((v0 + v1) / 2) * L;
+        this.hitShade = pelvic
+          ? 1 - clamp((va - root) / Math.max(1, L * vr - root), 0, 1)
+          : 1 - clamp((u - L * fan) / (L * (1 - fan)), 0, 1);
+      }
       return true;
     }
     return false;
   }
 
-  /** Whether a body point (s along, v across) falls on a dark marking. */
-  private marked(s: number, v: number, L: number, across: number) {
+  /**
+   * A humpback flipper at (u along, a out from the spine): a long blade of nearly even width,
+   * tapering a little and rounding off at the tip, swept back from the shoulder. The upper
+   * side is dark skin; the leading edge, the one facing the head, is white and knobbed with
+   * tubercles. Returns the cell's flag, or 0 when the point is off the flipper.
+   */
+  /**
+   * A fin is tested in a straight frame at its root (along, out), then the sample is turned
+   * about the root to pose the fin: swept by finSweep at the root and by finTipSweep more
+   * toward the tip (its arch, and its lag behind the flap). Turning rather than stretching keeps
+   * the fin its own length whatever the body does.
+   */
+  private poseFin(rootU: number, along: number, out: number, reach: number) {
+    const r = Math.hypot(along, out);
+    const res = this.finPose;
+    if (r < 1e-6) {
+      res.u = rootU;
+      res.a = 0;
+      return res;
+    }
+    const toTip = Math.min(1, r / Math.max(1, reach));
+    const turn = this.finSweep + this.finTipSweep * toTip;
+    const angle = clamp(Math.atan2(out, along) + turn, 0, Math.PI);
+    res.u = rootU + r * Math.cos(angle);
+    res.a = r * Math.sin(angle);
+    return res;
+  }
+
+  /** Point and tailward unit tangent on the render spine at fraction s of its length. */
+  private spineFrame(s: number, out: { x: number; y: number; tx: number; ty: number }) {
+    const { spine, arc } = this;
+    const target = clamp(s, 0, 1) * this.arcTotal;
+    let k = 0;
+    while (k < SHARK_NODES - 2 && arc[k + 1] < target) k++;
+    const ax = spine[k * 2];
+    const ay = spine[k * 2 + 1];
+    const bx = spine[k * 2 + 2];
+    const by = spine[k * 2 + 3];
+    const len = Math.hypot(bx - ax, by - ay) || 1;
+    const f = clamp((target - arc[k]) / len, 0, 1);
+    out.x = ax + (bx - ax) * f;
+    out.y = ay + (by - ay) * f;
+    out.tx = (bx - ax) / len;
+    out.ty = (by - ay) / len;
+  }
+
+  private inFlipper(u: number, a: number, L: number, tip: number) {
+    const [p0, p1, p2] = this.shape.pectoral;
+    const rootU = (L * (p0 + p1)) / 2;
+    const ax = L * p2 - rootU;
+    const ay = tip;
+    const len2 = ax * ax + ay * ay;
+    const px = u - rootU;
+    const t = (px * ax + a * ay) / len2;
+    if (t <= 0 || t >= 1) return 0;
+    // Distance across the blade, positive on the leading edge (toward the head).
+    const across = (a * ax - px * ay) / Math.sqrt(len2);
+    const round = t > 0.85 ? Math.sqrt(1 - ((t - 0.85) / 0.15) ** 2) : 1;
+    const half = ((L * (p1 - p0)) / 2) * (1 - 0.25 * t) * round;
+    if (Math.abs(across) > half) return 0;
+    if (across < half * 0.4) return FLAG_FIN;
+    return t > 0.15 && (t * 7) % 1 < 0.3 ? FLAG_RIDGE : FLAG_PALE;
+  }
+
+  private inCaudal(u: number, a: number, L: number) {
+    const { caudal, caudalFan } = this.shape;
+    if (caudalFan === undefined) return inTriangle(u, a, L * 0.86, 0, L * 0.95, 0, L, L * caudal);
+    // k runs 0 → 1 along the fan. It must stay below 1: every point past the tail tip
+    // projects onto it (u = L), and taking those in would hang a disc off the tail.
+    const k = (u - L * caudalFan) / (L * (1 - caudalFan));
+    if (k <= 0 || k >= 1) return false;
+    const spread = L * caudal;
+    if (a > spread * Math.pow(k, 0.7)) return false;
+    // Shallow fork: the middle of the trailing edge stops short of the lobes.
+    return k < 1 - 0.25 * (1 - a / spread);
+  }
+
+  /** Skin pattern at a body point (s along, v across): 0 for plain skin, FLAG_MARK (dark) or FLAG_HI (koi red). */
+  private marking(s: number, v: number, L: number, across: number) {
     if (this.shape === SHAPES.tiger) {
       // Wavy vertical bars over the back half, fading out toward the head.
-      if (s < 0.2 || s > 0.9 || across > 0.85) return false;
+      if (s < 0.2 || s > 0.9 || across > 0.85) return 0;
       const wobble = 0.35 * Math.sin((v / L) * 25 + s * 5);
       const bar = Math.sin(s * Math.PI * 2 * 9 + wobble);
-      return bar > 0.65 - 0.5 * smoothstep(0.2, 0.42, s) + 0.4 * smoothstep(0.8, 0.9, s);
+      return bar > 0.65 - 0.5 * smoothstep(0.2, 0.42, s) + 0.4 * smoothstep(0.8, 0.9, s) ? FLAG_MARK : 0;
     }
     if (this.shape === SHAPES.zebra) {
       // Leopard spots on a jittered grid, so they ride along with the skin.
-      if (s < 0.07) return false;
+      if (s < 0.07) return 0;
       const gu = (s * L) / (L * 0.06);
       const gv = v / (L * 0.045);
       const cu = Math.floor(gu);
       const cv = Math.floor(gv);
       const jx = hash3(cu, cv, this.sharkId) * 0.5 + 0.25;
       const jy = hash3(cu, cv, this.sharkId + 11) * 0.5 + 0.25;
-      return (gu - cu - jx) ** 2 + (gv - cv - jy) ** 2 < 0.08;
+      return (gu - cu - jx) ** 2 + (gv - cv - jy) ** 2 < 0.08 ? FLAG_MARK : 0;
     }
-    return false;
+    if (this.shape === SHAPES.humpback) {
+      // Tubercles: knobs scattered over the top of the head, caught by the light like the ridge.
+      if (s > 0.15 || across > 0.75) return 0;
+      const gu = s / 0.05;
+      const gv = v / (L * 0.04);
+      const cu = Math.floor(gu);
+      const cv = Math.floor(gv);
+      const jx = hash3(cu, cv, this.sharkId) * 0.5 + 0.25;
+      const jy = hash3(cu, cv, this.sharkId + 11) * 0.5 + 0.25;
+      return (gu - cu - jx) ** 2 + (gv - cv - jy) ** 2 < 0.05 ? FLAG_RIDGE : 0;
+    }
+    if (this.shape === SHAPES.koi) {
+      // Varieties cycle by id, so any pond shows several.
+      const variety = (this.sharkId - 1) % KOI_VARIETIES;
+      const w = v / L;
+      // Orenji ogon: orange all over, white fins and tail.
+      if (variety === 3) return s < 0.82 ? FLAG_HI : 0;
+      // Tancho: one red disc on the crown and nothing else.
+      if (variety === 2) return (s - 0.1) ** 2 + w * w < 0.042 ** 2 ? FLAG_HI : 0;
+      // Sanke: kohaku plus black sumi spots along the back.
+      if (variety === 1 && s > 0.2 && s < 0.78 && valueNoise(s * 14, w * 40, this.sharkId + 7) > 0.74) return FLAG_MARK;
+      // Kohaku: soft red blobs on white, the tail left clean.
+      return s < 0.8 && valueNoise(s * 7, w * 18, this.sharkId) > 0.52 ? FLAG_HI : 0;
+    }
+    return 0;
   }
 
   /**
@@ -641,9 +1188,11 @@ export class AsciiRenderer {
    * Fully covered cells become solid skin; partial cells become edge glyphs.
    */
   private rasterizeSharks(sharks: Shark[], t: number) {
-    const { sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow, spine, arc, cw, ch, cols, rows } = this;
+    const { sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow, floorShade, spine, arc, cw, ch, cols, rows } = this;
     sharkFlag.fill(0);
     sharkShadow.fill(0);
+    floorShade.fill(0);
+    const floor = !!this.scene?.floorShadow;
 
     for (const sh of sharks) {
       const L = sh.length;
@@ -652,6 +1201,7 @@ export class AsciiRenderer {
       const swim = clamp(sh.speed / 60, 0.4, 1.4);
       this.shape = SHAPES[sh.kind];
       this.sharkId = sh.id;
+      this.gape = sh.gape;
       const kindIndex = KINDS.indexOf(sh.kind);
 
       // Travelling body wave, growing toward the tail.
@@ -664,8 +1214,9 @@ export class AsciiRenderer {
         const tl = Math.hypot(tx, ty) || 1;
         tx /= tl;
         ty /= tl;
-        const amp = L * 0.05 * (0.1 + 0.9 * Math.pow(s, 1.8)) * swim;
-        const off = amp * Math.sin(sh.phase - s * 5.2);
+        const [waveAmp, wavePow, waveK] = this.shape.wave ?? [0.05, 1.8, 5.2];
+        const amp = L * waveAmp * (0.1 + 0.9 * Math.pow(s, wavePow)) * swim;
+        const off = amp * Math.sin(sh.phase - s * waveK);
         spine[k * 2] = n[k * 2] - ty * off;
         spine[k * 2 + 1] = n[k * 2 + 1] + tx * off;
       }
@@ -676,13 +1227,29 @@ export class AsciiRenderer {
           Math.hypot(spine[k * 2] - spine[(k - 1) * 2], spine[k * 2 + 1] - spine[(k - 1) * 2 + 1]);
       }
       this.arcTotal = arc[N - 1] || 1;
+      const { pectoral, pelvic } = this.shape;
+      this.spineFrame((pectoral[0] + pectoral[1]) / 2, this.pecFrame);
+      this.spineFrame((pelvic[0] + pelvic[1]) / 2, this.pelFrame);
+      const motion = this.shape.finMotion ?? DEFAULT_FIN_MOTION;
+      const flapPhase = sh.phase * motion.flap[1];
+      // A fin grows out of the body, so sweeping its root back buries more of it under the
+      // flank and it shows shorter. The root therefore only ever swings forward of rest, and
+      // the arch curves the fin about its middle (tip back, root forward by half as much)
+      // rather than turning it, so the visible length never drops below the resting one.
+      this.finSweep = motion.flap[0] * (Math.sin(flapPhase) - 1) - motion.arch * 0.5;
+      this.finTipSweep = motion.arch + motion.lag * Math.sin(flapPhase - 1.2);
 
-      // Bank into turns: the inside fin foreshortens, the outside one spreads.
+      // Bank into turns. Pectorals droop below the horizontal, so from above they
+      // foreshorten by cos(droop). Rolling tips the inside fin further down and levels
+      // the outside one; projection only ever shortens, so a level fin shows its true
+      // length and no more. The inside of a turn is the v < 0 side when bank > 0.
       const bank = clamp(sh.turn * 0.45, -0.35, 0.35);
-      const flex = 1 + 0.06 * Math.sin(sh.phase * 0.5);
-      const reachFin = this.shape.pectoral[3];
-      this.finTipRight = L * reachFin * flex * (1 - bank);
-      this.finTipLeft = L * reachFin * flex * (1 + bank);
+      const droop = PECTORAL_DROOP + 0.12 * Math.sin(sh.phase * 0.5);
+      const trueReach = (L * this.shape.pectoral[3]) / Math.cos(PECTORAL_DROOP);
+      this.finTipRight = trueReach * Math.cos(droop - bank);
+      this.finTipLeft = trueReach * Math.cos(droop + bank);
+      // Rolling by `bank` radians slides the back toward the inside of the turn.
+      this.rollX = -Math.sin(bank);
 
       let minX = Infinity;
       let minY = Infinity;
@@ -694,7 +1261,8 @@ export class AsciiRenderer {
         minY = Math.min(minY, spine[k * 2 + 1]);
         maxY = Math.max(maxY, spine[k * 2 + 1]);
       }
-      const reach = L * 0.36;
+      // Wide enough for the longest flipper even when it levels out in a bank.
+      const reach = L * Math.max(0.36, this.shape.pectoral[3] / Math.cos(PECTORAL_DROOP) + 0.02);
       const c0 = Math.max(0, Math.floor((minX - reach) / cw));
       const c1 = Math.min(cols - 1, Math.floor((maxX + reach) / cw));
       const r0 = Math.max(0, Math.floor((minY - reach) / ch));
@@ -702,8 +1270,14 @@ export class AsciiRenderer {
       if (c0 > c1 || r0 > r1) continue;
 
       const skipBeyond = reach + Math.hypot(cw, ch);
-      const shadowDc = Math.round((L * 0.035) / cw) + 1;
-      const shadowDr = Math.round((L * 0.02) / ch) + 1;
+      // Light comes from above at the scene's angle, so the shadow falls the other way.
+      const shadowDc = Math.round((-this.lightX * L * SHADOW_DROP) / cw);
+      const shadowDr = Math.round((-this.lightY * L * SHADOW_DROP) / ch);
+      const floorDrop = L * (FLOOR_DROP_DEEP + (FLOOR_DROP_SHALLOW - FLOOR_DROP_DEEP) * sh.depth);
+      const floorDc = Math.round((-this.lightX * floorDrop) / cw);
+      const floorDr = Math.round((-this.lightY * floorDrop) / ch);
+      // Nearer the surface, the shadow falls further off and spreads fainter.
+      const floorDark = 1.15 - 0.45 * sh.depth;
 
       for (let r = r0; r <= r1; r++) {
         for (let c = c0; c <= c1; c++) {
@@ -724,19 +1298,30 @@ export class AsciiRenderer {
           const coverage = hits / 5;
 
           const i = r * cols + c;
+          const solid = centerHit && coverage >= 0.6;
+          // Sharks are drawn deepest first. Where this one's soft edge crosses a deeper body,
+          // keep that body and shade it instead: a dark rim, not a hole punched through it.
+          if (!solid && sharkFlag[i] && sharkFlag[i] !== FLAG_EDGE) {
+            sharkShadow[i] = Math.max(sharkShadow[i], sh.depth);
+            continue;
+          }
           // Body-anchored key so each glyph rides along with the skin.
           const key = (hash3(Math.round(s * 52), Math.round(v / (cw * 0.9)), sh.id) * 4294967295) >>> 0;
           sharkKey[i] = key;
           sharkDepth[i] = sh.depth;
           sharkKind[i] = kindIndex;
 
-          if (centerHit && coverage >= 0.6) {
+          if (solid) {
             sharkFlag[i] = flag;
             const flicker = (hash3(c, r, Math.floor(t * 6)) - 0.5) * 0.06;
             sharkShade[i] = clamp(shade + flicker, 0, 1);
             const sc = c + shadowDc;
             const sr = r + shadowDr;
-            if (sc < cols && sr < rows) sharkShadow[sr * cols + sc] = 1;
+            if (sc >= 0 && sr >= 0 && sc < cols && sr < rows) {
+              const j = sr * cols + sc;
+              sharkShadow[j] = Math.max(sharkShadow[j], sh.depth);
+            }
+            if (floor) this.castOnFloor(c + floorDc, r + floorDr, floorDark);
           } else {
             sharkFlag[i] = FLAG_EDGE;
             sharkShade[i] = coverage;
@@ -746,8 +1331,93 @@ export class AsciiRenderer {
     }
   }
 
+  /** Lay a soft shadow on the floor around cell (c, r): full in the cell, half beside it. */
+  private castOnFloor(c: number, r: number, dark: number) {
+    const { cols, rows, floorShade } = this;
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        const cc = c + dc;
+        const rr = r + dr;
+        if (cc < 0 || rr < 0 || cc >= cols || rr >= rows) continue;
+        const j = rr * cols + cc;
+        const v = (dc === 0 && dr === 0 ? 1 : dc === 0 || dr === 0 ? 0.5 : 0.25) * dark;
+        if (v > floorShade[j]) floorShade[j] = v;
+      }
+    }
+  }
+
+  /**
+   * Leaf shade over everything in the water: the floor, the koi, the fish, the rings. It stays a
+   * continuous image multiplied over the lot, not glyphs: the shrub is known by its leaves and
+   * twigs, finer than a cell. A leaf's shadow slides off the stone onto a koi's back and off
+   * again; the koi swim a hand's depth under the surface, too little to set them apart.
+   */
+  private drawShade() {
+    const { ctx, canopy, shadeAmount } = this;
+    const image = canopy.image;
+    if (shadeAmount <= 0.001 || !image) return;
+    ctx.globalCompositeOperation = "multiply";
+    ctx.globalAlpha = shadeAmount;
+    ctx.drawImage(image, 0, 0, canopy.imageWidth, canopy.imageHeight);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+  }
+
+
+  /**
+   * The net of light on the floor, in white beads, fuller and stronger where it is brighter;
+   * under everything in the water, and not where a fish or a koi lies over it.
+   */
+  private drawCaustics() {
+    const { ctx, caustics, cols, cw, ch, sharkFlag, fishStamp, frameId, causticStyles } = this;
+    if (!caustics.active || !causticStyles.length) return;
+    const level = caustics.level;
+    for (let i = 0; i < level.length; i++) {
+      const e = level[i];
+      if (e < CAUSTIC_SHOW || sharkFlag[i] || fishStamp[i] === frameId) continue;
+      const u = Math.min(0.999, Math.log(e / CAUSTIC_SHOW) / Math.log(CAUSTIC_FULL / CAUSTIC_SHOW));
+      ctx.fillStyle = causticStyles[Math.floor(u * CAUSTIC_INKS)];
+      ctx.fillText(CAUSTIC_GLYPHS[Math.floor(u * CAUSTIC_GLYPHS.length)], (i % cols) * cw + cw / 2, ((i / cols) | 0) * ch + ch / 2 + 1);
+    }
+  }
+
+  /**
+   * Sun mirrored off the ripples, on the surface over everything: a lone spark in the sun's
+   * yellow. A food pellet is a brown dot that holds still; a glint flashes, `+` as it comes and
+   * goes and `*` at its height, so it twinkles as the ripples pass. A glow around it would tell
+   * it from food too, but it isn't drawn in glyphs, so the difference is in the glyph.
+   */
+  private drawGlints() {
+    const { ctx, caustics, cols, cw, ch, glintStyle } = this;
+    if (!caustics.active || !glintStyle) return;
+    ctx.fillStyle = glintStyle;
+    for (const { cell, strength } of caustics.glints) {
+      ctx.fillText(strength < GLINT_PEAK ? "+" : "*", (cell % cols) * cw + cw / 2, ((cell / cols) | 0) * ch + ch / 2 + 1);
+    }
+  }
+
+
+  /** Sunlight reaching cell i through the canopy, as much of its shade as falls now. */
+  private sunAt(i: number) {
+    return this.shadeAmount > 0.001 ? 1 - (1 - this.canopy.sun[i]) * this.shadeAmount : 1;
+  }
+
+  /** Shadows on the pond floor, under everything else in the water. */
+  private drawFloorShadows() {
+    const { ctx, cols, rows, cw, ch, floorShade, sharkFlag, floorStyles } = this;
+    if (!floorStyles.length) return;
+    const n = cols * rows;
+    for (let i = 0; i < n; i++) {
+      // A koi can only shade the floor where the sun reaches it.
+      const v = floorShade[i] * this.sunAt(i);
+      if (v <= 0 || sharkFlag[i]) continue;
+      ctx.fillStyle = floorStyles[clamp(Math.floor(v * FLOOR_LEVELS.length), 0, FLOOR_LEVELS.length - 1)];
+      ctx.fillRect((i % cols) * cw, ((i / cols) | 0) * ch, cw, ch);
+    }
+  }
+
   private drawSharks(t: number) {
-    const { ctx, cols, rows, cw, ch, sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind } = this;
+    const { ctx, cols, rows, cw, ch, sharkFlag, sharkShade, sharkKey, sharkDepth, sharkKind, sharkShadow } = this;
     const n = cols * rows;
     for (let i = 0; i < n; i++) {
       const flag = sharkFlag[i];
@@ -758,8 +1428,24 @@ export class AsciiRenderer {
       const y = row * ch;
       const key = sharkKey[i];
       const shade = sharkShade[i];
-      const dim = 0.7 + 0.3 * sharkDepth[i];
-      const [tr, tg, tb] = SHAPES[KINDS[sharkKind[i]]].tint;
+      const depth = sharkDepth[i];
+      // Shaded by a creature swimming above: its shadow, or the rim where its edge crosses.
+      const shadowed = sharkShadow[i] > depth + 0.001;
+      // A pale floor's fill light softens the shadow one fish casts on another.
+      const dim = (0.7 + 0.3 * depth) * (shadowed ? SHADOW + (1 - SHADOW) * this.ambient : 1);
+      const fog = clamp((1 - depth) * FOG_RATE, 0, FOG_MAX) * this.fogStrength;
+      const [fogR, fogG, fogB] = this.fogRGB;
+      // Glyphs fade into their own cell (or the water, for edges) as the creature goes deeper.
+      ctx.globalAlpha = 1 - fog * 0.7;
+      const shape = SHAPES[KINDS[sharkKind[i]]];
+      const [tr, tg, tb] =
+        flag === FLAG_HI
+          ? HI_TINT
+          : flag === FLAG_PALE
+            ? (shape.pectoralTint ?? shape.tint)
+            : flag === FLAG_FIN && shape.glossy
+              ? GLOSSY_FIN_TINT
+              : shape.tint;
 
       // Colours re-roll on a staggered clock so the hide shimmers.
       const tick = Math.floor(t * 2.4 + (key % 997) / 97);
@@ -771,8 +1457,8 @@ export class AsciiRenderer {
         const g = (70 + shade * 80) * dim;
         ctx.fillStyle =
           roll < 0.07
-            ? ACCENTS[key % ACCENTS.length]
-            : `rgb(${Math.round(g * tr)},${Math.round(g * tg)},${Math.min(255, Math.round(g * tb + 6))})`;
+            ? this.accents[key % this.accents.length]
+            : `rgb(${Math.round(g * tr + (fogR - g * tr) * fog)},${Math.round(g * tg + (fogG - g * tg) * fog)},${Math.min(255, Math.round(g * tb + 6 + (fogB - g * tb - 6) * fog))})`;
         ctx.fillText(set[(key >>> 8) % set.length], x + cw / 2, y + ch / 2 + 1);
         continue;
       }
@@ -781,7 +1467,8 @@ export class AsciiRenderer {
       let glyph: string;
       if (flag === FLAG_RIDGE) {
         level = 226;
-        glyph = RIDGE_GLYPHS[(key >>> 8) % RIDGE_GLYPHS.length];
+        // On a koi the back reads as the row of big mirror scales doitsu koi carry there.
+        glyph = shape.glossy ? "o" : RIDGE_GLYPHS[(key >>> 8) % RIDGE_GLYPHS.length];
       } else if (flag === FLAG_EYE) {
         level = 12;
         glyph = "o";
@@ -791,24 +1478,74 @@ export class AsciiRenderer {
       } else if (flag === FLAG_FIN) {
         level = 40 + shade * 120;
         glyph = FIN_GLYPHS[(key >>> 8) % FIN_GLYPHS.length];
+        if (shape.glossy) {
+          // A white translucent membrane with fine rays; mixed below with a little of whatever
+          // lies behind it, dark water or a pale floor.
+          // shade is the membrane's thickness here: the glyphs thin out toward the rim with it.
+          level = GLOSSY_FIN_LEVEL;
+          const jitter = ((key >>> 4) % 3) - 1;
+          glyph = GLOSSY_FIN_RAMP[clamp(Math.floor(shade * (GLOSSY_FIN_RAMP.length - 0.01)) + jitter, 0, GLOSSY_FIN_RAMP.length - 1)];
+        }
       } else {
         level = 46 + shade * 160;
         const jitter = ((key >>> 4) % 3) - 1;
-        glyph = SKIN_RAMP[clamp(Math.floor((1 - shade) * 8.99) + jitter, 0, SKIN_RAMP.length - 1)];
+        const ramp = shape.glossy ? GLOSSY_RAMP : SKIN_RAMP;
+        glyph = ramp[clamp(Math.floor((1 - shade) * (ramp.length - 0.01)) + jitter, 0, ramp.length - 1)];
       }
       level *= dim;
+      // Fill light from a pale floor lifts unlit skin most and lit skin least. Pigment (black
+      // sumi, the eye) stays dark: fill light brightens light, it doesn't bleach colour.
+      if (flag !== FLAG_EYE && flag !== FLAG_MARK) level += (FILL_LEVEL - level) * this.ambient * (1 - 0.6 * shade);
       // Tinted per species; the classic tint is a cool blue-grey, like a back seen through deep water.
-      ctx.fillStyle = `rgb(${Math.min(255, Math.round(level * tr))},${Math.min(255, Math.round(level * tg))},${Math.min(255, Math.round(level * tb + 4))})`;
+      let skinR = Math.min(255, Math.round(level * tr));
+      let skinG = Math.min(255, Math.round(level * tg));
+      let skinB = Math.min(255, Math.round(level * tb + 4));
+      if (flag === FLAG_FIN && shape.glossy) {
+        const [wr, wg, wb] = this.waterRGB;
+        const see = GLOSSY_FIN_SEE + (GLOSSY_FIN_SEE_EDGE - GLOSSY_FIN_SEE) * (1 - shade);
+        skinR = Math.round(skinR + (wr - skinR) * see);
+        skinG = Math.round(skinG + (wg - skinG) * see);
+        skinB = Math.round(skinB + (wb - skinB) * see);
+      }
+      // The block is opaque, so it takes the fog itself rather than through alpha.
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = `rgb(${Math.round(skinR + (fogR - skinR) * fog)},${Math.round(skinG + (fogG - skinG) * fog)},${Math.round(skinB + (fogB - skinB) * fog)})`;
       ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
+      ctx.globalAlpha = 1 - fog * 0.7;
 
       let color: string;
       if (flag === FLAG_EYE) color = "#9aa0ad";
       else if (flag === FLAG_MARK) color = `rgb(${Math.round(70 * tr)},${Math.round(70 * tg)},${Math.round(70 * tb)})`;
-      else if (roll < 0.09) color = ACCENTS[key % ACCENTS.length];
+      else if (roll < 0.09) color = this.accents[key % this.accents.length];
       else if (roll < 0.13) color = "#ffffff";
-      else color = shade > 0.55 ? "#0e0f13" : "#1b1d24";
+      else if (shape.glossy) {
+        color = `rgb(${Math.round(skinR * GLOSSY_INK)},${Math.round(skinG * GLOSSY_INK)},${Math.round(skinB * GLOSSY_INK)})`;
+      } else color = shade > 0.55 ? "#0e0f13" : "#1b1d24";
       ctx.fillStyle = color;
       ctx.fillText(glyph, x + cw / 2, y + ch / 2 + 1);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /** Rising air shows as faint specks; at the surface it foams as O → o → ° and fades. */
+  private drawBubbles(world: World) {
+    const { ctx, cw, ch, bubbleStyles } = this;
+    for (const b of world.bubbles) {
+      const c = Math.floor(b.x / cw);
+      const r = Math.floor(b.y / ch);
+      if (c < 0 || r < 0 || c >= this.cols || r >= this.rows) continue;
+      let glyph: string;
+      let level: number;
+      if (b.age < BUBBLE_RISE) {
+        glyph = ".";
+        level = 0;
+      } else {
+        const a = (b.age - BUBBLE_RISE) / BUBBLE_LIFE;
+        glyph = a < 0.12 ? "O" : a < 0.55 ? "o" : "°";
+        level = clamp(Math.floor((1 - a) * bubbleStyles.length), 0, bubbleStyles.length - 1);
+      }
+      ctx.fillStyle = bubbleStyles[level];
+      ctx.fillText(glyph, c * cw + cw / 2, r * ch + ch / 2 + 1);
     }
   }
 
@@ -820,15 +1557,21 @@ export class AsciiRenderer {
    * claim a cell first when two land in the same one.
    */
   private markFish(world: World) {
-    const { fishStamp, fishBuckets, sharkFlag } = this;
+    const { fishStamp, fishBuckets, sharkFlag, foodCells } = this;
+    const species = world.scene.species;
     const frame = ++this.frameId;
     for (const bucket of fishBuckets) bucket.length = 0;
+    foodCells.length = 0;
     for (let pass = 0; pass < 2; pass++) {
       for (const f of world.fish) {
         if (!f.alive || (f.depth > 0.78 ? 0 : 1) !== pass) continue;
         const i = this.cellIndex(f.x, f.y);
         if (i < 0 || fishStamp[i] === frame || sharkFlag[i]) continue;
         fishStamp[i] = frame;
+        if (species[f.species].food) {
+          foodCells.push(i);
+          continue;
+        }
         const glint = clamp(Math.abs(f.turn) / 3.5, 0, 1);
         const v = 0.3 + (0.4 * (f.depth - 0.55)) / 0.45 + 0.3 * Math.max(glint, f.alarm);
         fishBuckets[clamp(Math.floor(v * FISH_ALPHAS.length), 0, FISH_ALPHAS.length - 1)].push(i);
@@ -845,6 +1588,10 @@ export class AsciiRenderer {
       for (const i of bucket) {
         ctx.fillText("-", (i % cols) * cw + cw / 2, ((i / cols) | 0) * ch + ch / 2 + 1);
       }
+    }
+    ctx.fillStyle = this.foodStyle;
+    for (const i of this.foodCells) {
+      ctx.fillText(FOOD_GLYPH, (i % cols) * cw + cw / 2, ((i / cols) | 0) * ch + ch / 2 + 1);
     }
   }
 
@@ -871,17 +1618,21 @@ export class AsciiRenderer {
     const n = cols * rows;
     const SKIP = bucketCounts.length - 1;
     bucketCounts.fill(0);
+    // Wake glows once it builds up; on ripple water only the crests show, as rings.
+    const ripple = this.scene?.water === "ripple";
+    const show = ripple ? RIPPLE_SHOW : 0.45;
+    const gain = ripple ? RIPPLE_GAIN : 5;
 
     for (let i = 0; i < n; i++) {
       const e = energy[i];
       const kind = dotKind[i];
-      if (sharkFlag[i] || fishStamp[i] === frameId || (kind === 0 && e < 0.45)) {
+      if (sharkFlag[i] || fishStamp[i] === frameId || (kind === 0 && e < show)) {
         bucketOf[i] = SKIP;
         continue;
       }
       let bucket: number;
-      if (e > 0.45) {
-        const level = clamp(Math.floor((e - 0.45) * 5), 0, ALPHA_LEVELS - 1);
+      if (e > show) {
+        const level = clamp(Math.floor((e - show) * gain), 0, ALPHA_LEVELS - 1);
         bucket = WAKE * ALPHA_LEVELS + level;
       } else {
         const col = i % cols;

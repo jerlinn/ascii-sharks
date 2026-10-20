@@ -18,9 +18,16 @@ export interface Species {
   mill: number;
   /** Damps vertical speed; real fish mostly cruise level. */
   verticalDrag: number;
+  /**
+   * A food pellet rather than a fish: it only drifts on the current, never schools or flees,
+   * and comes back only when someone drops more. Give it weight 0 so no school is made of it.
+   */
+  food?: boolean;
+  /** How hard predators push this species away; krill barely manage to flee a whale. */
+  fear?: number;
 }
 
-export const SPECIES: Species[] = [
+export const OCEAN_SPECIES: Species[] = [
   {
     name: "sardine",
     cruise: 36, maxSpeed: 64, minSpeed: 18, weight: 3,
@@ -53,12 +60,38 @@ export const SPECIES: Species[] = [
   },
 ];
 
-const TOTAL_WEIGHT = SPECIES.reduce((sum, s) => sum + s.weight, 0);
+// Koi pond: one small school of ricefish, plus the pellets a click scatters.
+export const POND_SPECIES: Species[] = [
+  {
+    name: "medaka",
+    cruise: 24, maxSpeed: 52, minSpeed: 10, weight: 1,
+    schoolSize: [7, 11], spacing: [1.6, 1.1],
+    align: 2, cohesion: 1.3, jitter: 45, mill: 0, verticalDrag: 0.8,
+  },
+  {
+    name: "pellet",
+    cruise: 0, maxSpeed: 0, minSpeed: 0, weight: 0,
+    schoolSize: [0, 0], spacing: [1, 1],
+    align: 0, cohesion: 0, jitter: 0, mill: 0, verticalDrag: 0,
+    food: true,
+  },
+];
 
-export function pickSpecies() {
-  let r = Math.random() * TOTAL_WEIGHT;
-  for (let i = 0; i < SPECIES.length; i++) {
-    r -= SPECIES[i].weight;
+// Bubble-net scene: dense, slow krill swarms that only half-heartedly flee.
+export const KRILL_SPECIES: Species[] = [
+  {
+    name: "krill",
+    cruise: 12, maxSpeed: 40, minSpeed: 4, weight: 1,
+    schoolSize: [60, 90], spacing: [1.1, 1],
+    align: 0.5, cohesion: 2.4, jitter: 35, mill: 20, verticalDrag: 0.2,
+    fear: 0.2,
+  },
+];
+
+export function pickSpecies(species: Species[]) {
+  let r = Math.random() * species.reduce((sum, s) => sum + s.weight, 0);
+  for (let i = 0; i < species.length; i++) {
+    r -= species[i].weight;
     if (r <= 0) return i;
   }
   return 0;

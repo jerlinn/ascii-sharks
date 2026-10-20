@@ -7,8 +7,9 @@
     "jsx": "react-jsx",
     "strict": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "types": ["vite/client"]
   },
-  "include": ["src", "demo.ts"],
+  "include": ["src", "demo.ts", "story.ts"],
   "exclude": ["src/react.tsx"]
 }

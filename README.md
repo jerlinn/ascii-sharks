@@ -27,7 +27,7 @@ npm install && npm run dev
 ```
 
 ```ts
-import { OceanEngine } from "./src";
+import { OCEAN, OceanEngine } from "./src";
 
-const engine = new OceanEngine(canvas, [{ kind: "hammerhead", size: 1 }]);
+const engine = new OceanEngine(canvas, { ...OCEAN, sharks: [{ kind: "hammerhead", size: 1 }] });
 ```

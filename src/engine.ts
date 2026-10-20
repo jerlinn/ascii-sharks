@@ -1,7 +1,8 @@
 import { AsciiRenderer } from "./renderer";
-import { World, type SharkSpec } from "./world";
+import { OCEAN, themed, type Scene, type Theme } from "./scene";
+import { World } from "./world";
 
-const STEP = 1 / 60;
+export const STEP = 1 / 60;
 const MAX_STEPS = 4;
 
 /**
@@ -19,9 +20,20 @@ export class OceanEngine {
   private resizeObserver: ResizeObserver;
   private intersectionObserver: IntersectionObserver;
   private disposed = false;
+  /** Paused: no frames of its own; time moves only through advance() and draw(). */
+  private paused = false;
+  /** The scene as given, before the theme recolours it. */
+  private base: Scene;
+  private currentTheme: Theme = "dark";
 
-  constructor(private canvas: HTMLCanvasElement, sharks?: SharkSpec[]) {
-    this.world = new World(sharks);
+  /** maxDpr caps the canvas resolution; an export lifts it to render at the capture's scale. */
+  constructor(
+    private canvas: HTMLCanvasElement,
+    scene: Scene = OCEAN,
+    private options: { maxDpr?: number } = {},
+  ) {
+    this.base = scene;
+    this.world = new World(scene);
     this.renderer = new AsciiRenderer(canvas);
     this.renderer.setFontFamily(getComputedStyle(canvas).fontFamily);
     this.reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -60,10 +72,91 @@ export class OceanEngine {
     window.removeEventListener("blur", this.onPointerLeave);
   }
 
+  /** The scene as given (untinted by the theme). */
+  get scene() {
+    return this.base;
+  }
+
+  setScene(scene: Scene) {
+    this.base = scene;
+    this.world.setScene(themed(scene, this.currentTheme));
+    if (this.reducedMotion.matches) this.drawStill(true);
+  }
+
+  /** Light or dark. Only recolours, and only scenes with a daylight palette; nothing reseeds. */
+  setTheme(theme: Theme) {
+    this.currentTheme = theme;
+    this.world.restyle(themed(this.base, theme));
+    if (this.reducedMotion.matches) this.drawStill(false);
+  }
+
+  get theme() {
+    return this.currentTheme;
+  }
+
+  /**
+   * Let the scene's wind blow or die down, without disturbing anything else in the water. It
+   * eases over a couple of seconds; `instant` sets it outright, as when a page opens.
+   */
+  setWind(on: boolean, instant = false) {
+    this.world.setWind(on, instant);
+  }
+
+  get wind() {
+    return this.world.windEnabled;
+  }
+
+  /** Let a scene's canopy cast its shade or not; it fades over about a second unless `instant`. */
+  setShade(on: boolean, instant = false) {
+    // A still frame has no time to fade over.
+    this.world.setShade(on, instant || this.reducedMotion.matches);
+    if (this.reducedMotion.matches) this.drawStill(false);
+  }
+
+  get shade() {
+    return this.world.shadeEnabled;
+  }
+
+  /** Stop the clock for frame-by-frame capture; from here on only advance() and draw() move it. */
+  pause() {
+    this.paused = true;
+    cancelAnimationFrame(this.raf);
+  }
+
+  /** Seconds simulated so far. */
+  get time() {
+    return this.world.time;
+  }
+
+  /** Run the simulation dt seconds on, in fixed steps, without drawing. */
+  advance(dt: number) {
+    for (let i = Math.round(dt / STEP); i > 0; i--) this.world.step(STEP);
+  }
+
+  /** Draw the water as it is now; dt is how long since the last draw, for wakes and ripples. */
+  draw(dt: number) {
+    this.renderer.render(this.world, dt);
+  }
+
+  /** A click on the water at (x, y) px in the canvas: food or a splash, as the scene has it. */
+  poke(x: number, y: number) {
+    this.world.poke(x, y);
+  }
+
+  /** The whales' feeding: "rest", "net" while they ring a swarm, "lunge" up through it. */
+  get podPhase() {
+    return this.world.podPhase;
+  }
+
+  /** Food still afloat. */
+  get pellets() {
+    return this.world.fish.filter((f) => f.alive && this.world.scene.species[f.species].food).length;
+  }
+
   private resize() {
     const rect = this.canvas.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, this.options.maxDpr ?? 2);
     this.renderer.resize(rect.width, rect.height, dpr);
     this.world.resize(rect.width, rect.height, this.renderer.cellWidth, this.renderer.cellHeight);
     if (this.reducedMotion.matches) this.drawStill();
@@ -71,7 +164,7 @@ export class OceanEngine {
 
   private schedule() {
     cancelAnimationFrame(this.raf);
-    if (this.disposed || !this.visible || this.reducedMotion.matches) return;
+    if (this.disposed || this.paused || !this.visible || this.reducedMotion.matches) return;
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.frame);
   }
@@ -92,8 +185,8 @@ export class OceanEngine {
   };
 
   /** Reduced motion: let the ecosystem settle, then show a single frame. */
-  private drawStill() {
-    if (this.world.time < 4) {
+  private drawStill(settle = this.world.time < 4) {
+    if (settle) {
       for (let i = 0; i < 240; i++) this.world.step(STEP);
     }
     this.renderer.render(this.world, STEP);
@@ -126,7 +219,7 @@ export class OceanEngine {
 
   private onPointerDown = (e: PointerEvent) => {
     const { x, y, inside } = this.toLocal(e);
-    if (inside && !this.reducedMotion.matches) this.world.splash(x, y);
+    if (inside && !this.reducedMotion.matches) this.world.poke(x, y);
   };
 
   private onPointerLeave = () => {
