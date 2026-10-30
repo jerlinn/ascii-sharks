@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "export:video": "node tools/export-video.mjs"
+    "export:video": "node tools/export-video.mjs",
+    "check:butterflies": "node tools/check-butterflies.mjs"
   },
   "devDependencies": {
     "@phosphor-icons/core": "^2.1.1",

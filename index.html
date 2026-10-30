@@ -24,7 +24,11 @@
       .controls button[hidden] { display: none; }
       body.export .scenes, body.export .controls { visibility: hidden; }
       /* Too narrow for both bars on one line: the switches sit a row above the scenes. */
-      @media (max-width: 560px) { .controls { bottom: 52px; left: 16px; right: auto; } }
+      @media (max-width: 560px) {
+        .scenes { right: 16px; flex-wrap: wrap; }
+        .scenes button { padding: 6px 8px; }
+        .controls { bottom: 90px; left: 16px; right: auto; }
+      }
       body.light .scenes button, body.light .controls button { color: rgba(20,40,30,0.55); background: rgba(255,255,255,0.7); border-color: rgba(20,40,30,0.12); }
       body.light .scenes button span, body.light .controls button span { color: rgba(20,40,30,0.3); }
       body.light .scenes button:hover, body.light .controls button:hover { color: rgba(20,40,30,0.9); }

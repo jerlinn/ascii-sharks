@@ -16,6 +16,7 @@
 import { angleDiff, clamp, current, rand, randInt, TAU, windAt } from "./math";
 import { OCEAN, type Scene } from "./scene";
 import { pickSpecies } from "./species";
+import { ButterflyField } from "./butterflies";
 
 export const SHARK_NODES = 20;
 
@@ -233,6 +234,7 @@ export class World {
   sharks: Shark[] = [];
   events: WorldEvent[] = [];
   bubbles: Bubble[] = [];
+  readonly meadow = new ButterflyField();
   private pod: Pod = { phase: "rest", until: 0, started: 0, x: 0, y: 0, radius0: 0, radius: 0, dir: 1 };
   pointer = { x: 0, y: 0, active: false };
 
@@ -288,6 +290,12 @@ export class World {
     this.cellH = cellH;
     this.setSpacing();
 
+    if (this.scene.meadow) {
+      if (first || this.meadow.butterflies.length === 0) this.seed();
+      else this.meadow.resize(width, height);
+      return;
+    }
+
     if (first || this.fish.length === 0) {
       this.seed();
       return;
@@ -309,6 +317,9 @@ export class World {
 
   seed() {
     const { width: W, height: H } = this;
+    this.events.length = 0;
+    this.meadow.clear();
+    if (this.scene.meadow) this.meadow.seed(W, H, this.scene.meadow, this.time);
     const minSide = Math.min(W, H);
     const baseLength = clamp(minSide * 0.44, 170, 430);
     const sharkSpecs = this.scene.sharks;
@@ -408,7 +419,8 @@ export class World {
 
   /** A click on the water: scatter the fish, or drop food, depending on the scene. */
   poke(x: number, y: number) {
-    if (this.scene.click === "feed") this.feed(x, y);
+    if (this.scene.meadow) this.meadow.scatter(x, y, this.time);
+    else if (this.scene.click === "feed") this.feed(x, y);
     else this.splash(x, y);
   }
 
@@ -492,6 +504,10 @@ export class World {
     // A breeze rises and dies away over a couple of seconds rather than switching.
     this.windEase += ((this.windOn ? 1 : 0) - this.windEase) * Math.min(1, dt * 1.2);
     this.shadeEase += ((this.shadeOn ? 1 : 0) - this.shadeEase) * Math.min(1, dt * 2);
+    if (this.scene.meadow) {
+      this.meadow.step(dt, this.time, this.windSpeed, this.pointer);
+      return;
+    }
     if (this.scene.rain > 0 && this.time >= this.nextRain) {
       this.events.push({ kind: "drop", x: rand(0, this.width), y: rand(0, this.height) });
       // Poisson arrivals, so the drops never fall into a beat.

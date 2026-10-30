@@ -2,34 +2,28 @@
 
 ![Koi drawn in ASCII glyphs swimming in a pale green pond](docs/cover.gif)
 
-```
-                            ;'
-                             %%'
-                              .t;.               .oooo
-                               S;:S%              %8S8.
-                                ;:tt%t '..        XX%%S
-t'                            ''XSSS8SSX%XX8#.    %XSX%
- :;'               ;.''X8%8XX%%S%%S%SStt%tSX8S#X8't%ttt.
-  ::%'       ''8XXXSSt%Stttttt%8@%%@%8@8%Sttt%%%%SSSSS%tt.
-  'SXXtt%t%%%S%:;StS%ttSS%tSXSt88@@%8%@8%tStS%%X%SS%%S%;;t
- .@##88#@...'@@@@#@8@88X88#XXXSX8SX88SX8%SS%S%%S88St%t%%%.
-  %;%t             :.    '.'##@###@X#888XX##8@@@#.X%XS%.
- .%t                            ;%%%#@@##@@@.     SXS%%
- t.                            .%;%%%.            %%XXS
-                              '%t:t              .SXSS'
-                             '::.                ooooo
-                            .S'
-                            .
-```
+Living creatures drawn as ASCII on a canvas, every frame computed: no sprites, no prebaked art. Zero runtime dependencies.
 
-Fish and sharks drawn as ASCII on a canvas. Zero dependencies.
+Five scenes share one engine:
+
+- **koi**: a pond with rain and ripples. Click to scatter food. By day, sunlight nets the floor with caustics.
+- **ocean**: sharks hunting schools of small fish.
+- **whales**: humpbacks blowing a bubble net round a krill swarm, then lunging up through it.
+- **dragon**: a white dragon threading in and out of a sea of cloud. Click to part the clouds.
+- **butterflies**: a sunlit meadow with clustered flowers, layered flight, sinusoidal wingbeats and occasional flower visits. Click to scatter nearby butterflies.
 
 ```sh
 pnpm install && pnpm dev
 ```
 
-```ts
-import { OCEAN, OceanEngine } from "./src";
+Keys `1`–`5` switch scenes. `W` toggles the wind, `L` toggles day and night in the koi pond, and `S` toggles its tree shade. The same settings work as URL parameters: `?scene=butterflies`, `?theme=light`, `?wind=off`, `?shade=on`.
 
-const engine = new OceanEngine(canvas, { ...OCEAN, sharks: [{ kind: "hammerhead", size: 1 }] });
+```ts
+import { DRAGON, OceanEngine } from "./src";
+
+const engine = new OceanEngine(canvas, DRAGON);
 ```
+
+How it works, and why it is built this way: [docs/PRINCIPLES.md](docs/PRINCIPLES.md) (in Chinese).
+
+Forked from [stackedlol/ascii-sharks](https://github.com/stackedlol/ascii-sharks).

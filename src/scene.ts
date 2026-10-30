@@ -1,6 +1,7 @@
 import { ENKIANTHUS, type Canopy } from "./canopy";
 import { POND_CAUSTICS, type Caustics } from "./caustics";
 import { SUNLIT_CLOUDS, type Clouds } from "./clouds";
+import { DAY_MEADOW, type Meadow } from "./butterflies";
 import { KRILL_SPECIES, OCEAN_SPECIES, POND_SPECIES, type Species } from "./species";
 import type { SharkSpec } from "./world";
 
@@ -47,7 +48,7 @@ export interface Scene {
    * A glowing wake that diffuses, a surface that carries ripples as waves, or a cloud sea, where
    * the same diffusing field shows no glow and only parts the clouds where a click lands.
    */
-  water: "wake" | "ripple" | "cloud";
+  water: "wake" | "ripple" | "cloud" | "air";
   /** Ripples bounce off the edges like a pond wall; without a shore they run out to open sea. */
   shore: boolean;
   /** Surface drift from the wind, px/s (gusting, its bearing wandering); 0 for still water. */
@@ -78,6 +79,8 @@ export interface Scene {
    * flies above casts a shadow on it. Null where there is open water instead.
    */
   clouds: Clouds | null;
+  /** A sunlit garden and its flying insects; absent in aquatic scenes. */
+  meadow?: Meadow;
   /** A light-mode palette, for scenes that have one: the same water by day, not inverted. */
   daylight?: Palette;
 }
@@ -269,4 +272,20 @@ export const DRAGON: Scene = {
   clouds: SUNLIT_CLOUDS,
 };
 
-export const SCENES: Scene[] = [KOI_POND, OCEAN, WHALES, DRAGON];
+// Always daylight: warm wings, cool grass and soft shadows on the ground below.
+export const BUTTERFLIES: Scene = {
+  ...OCEAN,
+  name: "butterflies",
+  sharks: [],
+  species: [],
+  background: "#e3ead3",
+  grid: "transparent",
+  fog: [227, 234, 211],
+  schoolDensity: 0,
+  water: "air",
+  wind: 14,
+  clearCenter: false,
+  meadow: DAY_MEADOW,
+};
+
+export const SCENES: Scene[] = [KOI_POND, OCEAN, WHALES, DRAGON, BUTTERFLIES];

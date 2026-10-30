@@ -11,6 +11,7 @@ import { CausticsField } from "./caustics";
 import { CloudField } from "./clouds";
 import { clamp, hash3, smoothstep, valueNoise, windAt } from "./math";
 import { RippleField } from "./ripple";
+import { MeadowRenderer } from "./meadow";
 import type { RGB, Scene } from "./scene";
 import { BUBBLE_LIFE, BUBBLE_RISE, SHARK_NODES, SLITHER_K, type Shark, type SharkKind, type World } from "./world";
 
@@ -673,6 +674,7 @@ export function paintGrid(
 }
 
 export class AsciiRenderer {
+  private meadow = new MeadowRenderer();
   private ctx: CanvasRenderingContext2D;
   private bg: HTMLCanvasElement;
   private dpr = 1;
@@ -933,6 +935,11 @@ export class AsciiRenderer {
     const { ctx, dpr, cols, ch } = this;
     if (cols === 0) return;
     if (world.scene !== this.scene) this.applyScene(world.scene, world);
+    if (world.scene.meadow) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      this.meadow.render(ctx, world, this.cw, this.ch, this.fontFamily);
+      return;
+    }
     const t = world.time;
     windAt(t, world.windSpeed, this.wind);
     // The gust field rides on the wind; carried step by step, so it slows when the wind eases
